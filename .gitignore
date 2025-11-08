@@ -150,3 +150,6 @@ test-results/
 
 # Jupyter
 *.ipynb_checkpoints/
+
+# Ignore the data samples used in the analysis notebooks
+realData/
