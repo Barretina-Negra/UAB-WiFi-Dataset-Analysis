@@ -178,20 +178,30 @@ def aggregate_by_group(df: pd.DataFrame, geo_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def create_optimized_heatmap(df: pd.DataFrame, center_lat: float, center_lon: float, 
-                              radius: int = 15, zoom: int = 15) -> go.Figure:
-    """Create an optimized heatmap with proper color layering (high values on top).
+                              min_conflictivity: float = 0.0, radius: int = 15, zoom: int = 15) -> go.Figure:
+    """Create an optimized heatmap with proper color layering and consistent density.
     
-    The key improvement is sorting data so high conflictivity values are rendered last,
-    ensuring they appear on top of lower values.
+    Key features:
+    - All APs are included in density calculation (consistent heatmap regardless of filter)
+    - APs below min_conflictivity have their intensity reduced to near-zero
+    - High conflictivity values render on top
+    - Color scale ALWAYS fixed to 0-1 range
     """
     # Sort by conflictivity so high values are plotted last (on top)
     df_sorted = df.sort_values('conflictivity', ascending=True).copy()
     
-    # Create figure with density mapbox
+    # Adjust the z-values (intensity) based on minimum threshold
+    # For APs below threshold, set intensity to near-zero (0.01) to make them nearly invisible
+    # For APs above threshold, keep their original conflictivity value
+    adjusted_z = df_sorted['conflictivity'].apply(
+        lambda x: x if x >= min_conflictivity else 0.01
+    ).tolist()
+    
+    # Create proper density heatmap
     fig = go.Figure(go.Densitymapbox(
         lat=df_sorted['lat'],
         lon=df_sorted['lon'],
-        z=df_sorted['conflictivity'],
+        z=adjusted_z,
         radius=radius,
         colorscale=[
             [0.0, 'rgb(0, 255, 0)'],      # Green (low conflictivity)
@@ -203,11 +213,16 @@ def create_optimized_heatmap(df: pd.DataFrame, center_lat: float, center_lon: fl
             title="Conflictivity",
             thickness=15,
             len=0.7,
+            tickmode='linear',
+            tick0=0,
+            dtick=0.2,
+            tickformat='.1f',
         ),
         hovertemplate='<b>%{text}</b><br>Conflictivity: %{z:.2f}<extra></extra>',
         text=df_sorted['name'],
         zmin=0,
         zmax=1,
+        zauto=False,
     ))
     
     fig.update_layout(
@@ -290,17 +305,20 @@ with st.sidebar:
     )
     
     min_conf = st.slider("Minimum conflictivity", 0.0, 1.0, 0.0, 0.01)
-    top_n = st.slider("Top N listing", 5, 50, 15, step=5)
+    top_n = st.slider(
+        "Top N listing", 
+        5, 50, 15, step=5,
+        help="Number of most conflictive APs to show in the table below the map"
+    )
 
 # Load data for selected timestamp
 ap_df = read_ap_snapshot(selected_path)
 
-# Merge AP + geoloc and filter
+# Merge AP + geoloc - DON'T filter by min_conf yet (we need all data for consistent heatmap)
 merged = ap_df.merge(geo_df, on="name", how="inner")
-merged = merged[pd.to_numeric(merged["conflictivity"], errors="coerce") >= min_conf]
 
 if merged.empty:
-    st.info("No APs matched the current filters.")
+    st.info("No APs have geolocation data.")
     st.stop()
 
 # Optional group filter (by prefix code) derived from current data
@@ -315,6 +333,7 @@ with st.sidebar:
         help="Select specific building codes to display"
     )
 
+# Apply group filter if selected
 if selected_groups:
     merged = merged[merged["name"].apply(extract_group).isin(selected_groups)]
 
@@ -323,6 +342,7 @@ if merged.empty:
     st.stop()
 
 # Prepare data for map (AP level aggregation only)
+# Keep ALL APs for consistent heatmap calculation
 map_df = merged.copy()
 
 if map_df.empty:
@@ -333,11 +353,12 @@ if map_df.empty:
 center_lat = float(map_df["lat"].mean())
 center_lon = float(map_df["lon"].mean())
 
-# Create optimized heatmap
+# Create optimized heatmap with ALL data, using min_conf for opacity control
 fig = create_optimized_heatmap(
     df=map_df,
     center_lat=center_lat,
     center_lon=center_lon,
+    min_conflictivity=min_conf,
     radius=radius,
     zoom=15
 )
@@ -345,24 +366,30 @@ fig = create_optimized_heatmap(
 st.plotly_chart(fig, use_container_width=True)
 
 
-# Top conflictive listing
+# Top conflictive listing - filter here for the table
 st.subheader("Top conflictive Access Points")
-cols = [c for c in ["name", "group_code", "client_count", "max_radio_util", "conflictivity"] if c in map_df.columns]
-tmp = map_df[cols].copy()
-if "group_code" not in tmp.columns:
-    tmp["group_code"] = tmp["name"].apply(extract_group)
-top_df = tmp.sort_values("conflictivity", ascending=False).head(top_n)
-top_df = top_df.rename(columns={"name": "Access Point", "group_code": "Building", "conflictivity": "Conflictivity Score"})
-if "client_count" in top_df.columns:
-    top_df = top_df.rename(columns={"client_count": "Clients"})
-if "max_radio_util" in top_df.columns:
-    top_df = top_df.rename(columns={"max_radio_util": "Max Radio Util %"})
-    
-# Format the score column
-if "Conflictivity Score" in top_df.columns:
-    top_df["Conflictivity Score"] = top_df["Conflictivity Score"].map(lambda x: f"{x:.3f}")
-    
-st.dataframe(top_df, use_container_width=True, hide_index=True)
+# Filter by minimum conflictivity for the table display
+filtered_for_table = map_df[map_df["conflictivity"] >= min_conf].copy()
+
+if filtered_for_table.empty:
+    st.info(f"No APs with conflictivity >= {min_conf:.2f}")
+else:
+    cols = [c for c in ["name", "group_code", "client_count", "max_radio_util", "conflictivity"] if c in filtered_for_table.columns]
+    tmp = filtered_for_table[cols].copy()
+    if "group_code" not in tmp.columns:
+        tmp["group_code"] = tmp["name"].apply(extract_group)
+    top_df = tmp.sort_values("conflictivity", ascending=False).head(top_n)
+    top_df = top_df.rename(columns={"name": "Access Point", "group_code": "Building", "conflictivity": "Conflictivity Score"})
+    if "client_count" in top_df.columns:
+        top_df = top_df.rename(columns={"client_count": "Clients"})
+    if "max_radio_util" in top_df.columns:
+        top_df = top_df.rename(columns={"max_radio_util": "Max Radio Util %"})
+        
+    # Format the score column
+    if "Conflictivity Score" in top_df.columns:
+        top_df["Conflictivity Score"] = top_df["Conflictivity Score"].map(lambda x: f"{x:.3f}")
+        
+    st.dataframe(top_df, use_container_width=True, hide_index=True)
 
 
 # Footer
