@@ -154,6 +154,5 @@ test-results/
 realData/
 
 .venv311/
-venv311/
 
 pabloCalo/pabloCalo/output/hourly_graphs/
