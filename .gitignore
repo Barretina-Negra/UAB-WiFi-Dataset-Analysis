@@ -147,3 +147,7 @@ composer.lock      # Usually commit for apps; ignore for libraries (decide team-
 # Test artifacts
 junit-report.xml
 test-results/
+
+# Jupyter
+*.ipynb
+*.ipynb_checkpoints/
