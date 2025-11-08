@@ -1,0 +1,149 @@
+# OS-specific junk
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+__MACOSX/
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+Desktop.ini
+$RECYCLE.BIN/
+ehthumbs.db
+
+# Linux
+.trash-*/
+.fuse_hidden*
+
+# Common editor/IDE artifacts
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# JetBrains (IntelliJ, WebStorm, PyCharm, etc.)
+.idea/
+*.iml
+
+# Eclipse
+.project
+.classpath
+.settings/
+
+# Vim/Neovim
+*~
+.*.swp
+.*.swo
+Session.vim
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# Sublime
+*.sublime-workspace
+*.sublime-project
+
+# System-wide temp/logs
+*.log
+logs/
+temp/
+tmp/
+
+# Node / frontend
+node_modules/
+dist/
+build/
+.cache/
+.npm/
+.pnpm-store/
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+coverage/
+.next/
+.out/
+.bazel/
+.nx/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+.env
+.venv/
+venv/
+pip-wheel-metadata/
+.eggs/
+*.egg-info/
+.mypy_cache/
+.pytype/
+.pytest_cache/
+
+# Java / JVM
+target/
+build/
+.gradle/
+.gradle-cache/
+out/
+*.class
+
+# Go
+bin/
+vendor/
+*.test
+
+# Rust
+target/
+Cargo.lock         # Keep or ignore based on library vs application; see note
+
+# C/C++
+*.o
+*.obj
+*.so
+*.dll
+*.dylib
+*.a
+*.lib
+*.exe
+build/
+
+# Ruby
+.bundle/
+vendor/bundle/
+coverage/
+.yardoc/
+doc/
+
+# PHP / Composer
+vendor/
+composer.lock      # Usually commit for apps; ignore for libraries (decide team-wide)
+
+# Databases and dumps
+*.sqlite
+*.sqlite3
+*.db
+*.sql
+*.dump
+
+# Environment and secrets (commit only templates)
+.env
+.env.*
+!.env.example
+!.env.template
+
+# IDE project-local settings
+*.code-workspace
+
+# Test artifacts
+junit-report.xml
+test-results/
