@@ -149,5 +149,4 @@ junit-report.xml
 test-results/
 
 # Jupyter
-*.ipynb
 *.ipynb_checkpoints/
