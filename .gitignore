@@ -98,7 +98,6 @@ out/
 *.class
 
 # Go
-bin/
 vendor/
 *.test
 
