@@ -154,4 +154,4 @@ test-results/
 # Ignore the data samples used in the analysis notebooks
 realData/
 
-pabloCalo/output/
+pabloCalo/pabloCalo/output/hourly_graphs/
