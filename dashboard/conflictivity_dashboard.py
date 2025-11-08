@@ -187,8 +187,9 @@ def create_optimized_heatmap(df: pd.DataFrame, center_lat: float, center_lon: fl
     - High conflictivity values render on top
     - Color scale ALWAYS fixed to 0-1 range
     """
-    # Sort by conflictivity so high values are plotted last (on top)
-    df_sorted = df.sort_values('conflictivity', ascending=True).copy()
+    # Sort by conflictivity DESCENDING so low values are plotted first,
+    # then high values (red) are plotted last and appear on top
+    df_sorted = df.sort_values('conflictivity', ascending=False).copy()
     
     # Adjust the z-values (intensity) based on minimum threshold
     # For APs below threshold, set intensity to near-zero (0.01) to make them nearly invisible
@@ -204,9 +205,9 @@ def create_optimized_heatmap(df: pd.DataFrame, center_lat: float, center_lon: fl
         z=adjusted_z,
         radius=radius,
         colorscale=[
-            [0.0, 'rgb(0, 255, 0)'],      # Green (low conflictivity)
-            [0.5, 'rgb(255, 255, 0)'],    # Yellow (medium)
-            [1.0, 'rgb(255, 0, 0)']       # Red (high conflictivity)
+            [0.0, 'rgb(0, 255, 0)'],        # Green (low conflictivity)
+            [0.5, 'rgb(255, 165, 0)'],      # Orange (medium)
+            [1.0, 'rgb(255, 0, 0)']         # Red (high conflictivity)
         ],
         showscale=True,
         colorbar=dict(
@@ -395,5 +396,5 @@ else:
 # Footer
 st.caption(
     "💡 **Conflictivity Formula:** 0.6 × normalized_clients + 0.4 × max_radio_utilization  |  "
-    "🎨 **Color Scale:** 🟢 Green (Low) → 🟡 Yellow (Medium) → 🔴 Red (High)"
+    "🎨 **Color Scale:** � Green (Low) → 🟠 Orange (Medium) → 🔴 Red (High)"
 )
