@@ -33,9 +33,11 @@ Run
   streamlit run dashboard/conflictivity_dashboard.py
 """
 
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -43,22 +45,17 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-
 
 # -------- Paths --------
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AP_DIR = REPO_ROOT / "realData" / "ap"
 GEOJSON_PATH = REPO_ROOT / "realData" / "geoloc" / "aps_geolocalizados_wgs84.geojson"
 
-
 # -------- Helpers --------
 def norm01(series: pd.Series, invert: bool = False) -> pd.Series:
-    """Normalize series to [0,1] range where 1 = worst.
-    Matches the exact algorithm from ap_problem_analysis.ipynb
-    """
+    """Simple min-max, falls back to 0.5 when no variance."""
     s = series.astype(float)
     rng = s.max() - s.min()
     if rng == 0 or np.isinf(rng) or np.isnan(rng):
@@ -66,199 +63,222 @@ def norm01(series: pd.Series, invert: bool = False) -> pd.Series:
     n = (s - s.min()) / rng
     return 1 - n if invert else n
 
-
 def extract_group(ap_name: Optional[str]) -> Optional[str]:
     if not isinstance(ap_name, str):
         return None
     m = re.match(r"^AP-([A-Za-z]+)", ap_name)
     return m.group(1) if m else None
 
-
 def find_snapshot_files(ap_dir: Path) -> List[Tuple[Path, datetime]]:
-    """Find all snapshot files and parse their timestamps.
-    Returns list of (path, datetime) tuples sorted by time."""
     files = list(ap_dir.glob("AP-info-v2-*.json"))
     files_with_time = []
-    
     for f in files:
-        # Parse timestamp from filename: AP-info-v2-2025-04-03T00_00_01+02_00.json
-        match = re.search(r'(\d{4})-(\d{2})-(\d{2})T(\d{2})_(\d{2})_(\d{2})', f.name)
-        if match:
-            year, month, day, hour, minute, second = map(int, match.groups())
-            dt = datetime(year, month, day, hour, minute, second)
-            files_with_time.append((f, dt))
-    
-    # Sort by datetime
+        m = re.search(r"(\d{4})-(\d{2})-(\d{2})T(\d{2})_(\d{2})_(\d{2})", f.name)
+        if m:
+            y, mo, d, h, mi, s = map(int, m.groups())
+            files_with_time.append((f, datetime(y, mo, d, h, mi, s)))
     files_with_time.sort(key=lambda x: x[1])
     return files_with_time
 
+# --- New scoring utilities ----------------------------------------------------
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
-def read_ap_snapshot(path: Path, band_filter: str = "average") -> pd.DataFrame:
-    """Load one AP snapshot JSON into a DataFrame with selected fields.
-    Columns: name, client_count, group_name, site, max_radio_util, cpu_utilization, mem_free, mem_total, conflictivity
-    
-    Args:
-        path: Path to the JSON snapshot file
-        band_filter: Frequency band to analyze - "2.4GHz", "5GHz", or "average" (default)
-                     - "2.4GHz": Only consider 2.4 GHz radios (band=0), use max if multiple
-                     - "5GHz": Only consider 5 GHz radios (band=1), use max if multiple
-                     - "average": Average of max(2.4GHz radios) and max(5GHz radios)
-    
-    Note: max_radio_util column contains:
-          - For single band modes: max utilization of radios on that band
-          - For average mode: average(max(5GHz), max(2.4GHz))
-    
-    Conflictivity formula based on ap_problem_analysis.ipynb:
-    - Radio utilization: 0.85 (primary indicator of channel congestion)
-    - Client load: 0.10 (normalized client count)
-    - CPU utilization: 0.02 (processing overhead)
-    - Memory usage: 0.03 (available resources)
+def airtime_score(util: float, band: str) -> float:
+    """
+    Map channel utilization % to [0,1] pain score.
+    Stricter on 2.4 GHz because overlap/legacy effects.
+    """
+    u = clamp(util or 0.0, 0.0, 100.0)
+    if band == "2g":
+        # 2.4 GHz thresholds
+        if u <= 10:
+            return 0.05 * (u / 10.0)  # 0–0.05
+        if u <= 25:
+            return 0.05 + 0.35 * ((u - 10) / 15.0)  # 0.05–0.40
+        if u <= 50:
+            return 0.40 + 0.35 * ((u - 25) / 25.0)  # 0.40–0.75
+        return 0.75 + 0.25 * ((u - 50) / 50.0)      # 0.75–1.00
+    else:
+        # 5 GHz thresholds
+        if u <= 15:
+            return 0.05 * (u / 15.0)  # 0–0.05
+        if u <= 35:
+            return 0.05 + 0.35 * ((u - 15) / 20.0)  # 0.05–0.40
+        if u <= 65:
+            return 0.40 + 0.35 * ((u - 35) / 30.0)  # 0.40–0.75
+        return 0.75 + 0.25 * ((u - 65) / 35.0)      # 0.75–1.00
+
+def client_pressure_score(n_clients: float, peers_p95: float) -> float:
+    """
+    Log-style pressure: small increases at low counts, stronger near heavy loads.
+    Normalized against the 95th percentile of current snapshot to reduce outlier bias.
+    """
+    n = max(0.0, float(n_clients or 0.0))
+    denom = max(1.0, float(peers_p95 or 1.0))
+    x = math.log1p(n) / math.log1p(denom)  # 0–1
+    return clamp(x, 0.0, 1.0)
+
+def cpu_health_score(cpu_pct: float) -> float:
+    """Begin to penalize after ~70%. 90%+ is severe."""
+    c = clamp(cpu_pct or 0.0, 0.0, 100.0)
+    if c <= 70:
+        return 0.0
+    if c <= 90:
+        return 0.6 * ((c - 70) / 20.0)  # 0–0.6
+    return 0.6 + 0.4 * ((c - 90) / 10.0)  # 0.6–1.0
+
+def mem_health_score(mem_used_pct: float) -> float:
+    """Penalize after 80% used. 95%+ is severe."""
+    m = clamp(mem_used_pct or 0.0, 0.0, 100.0)
+    if m <= 80:
+        return 0.0
+    if m <= 95:
+        return 0.6 * ((m - 80) / 15.0)  # 0–0.6
+    return 0.6 + 0.4 * ((m - 95) / 5.0)  # 0.6–1.0
+
+def read_ap_snapshot(path: Path, band_mode: str = "worst") -> pd.DataFrame:
+    """
+    band_mode:
+      - "worst": max(max_2g, max_5g)  [recommended]
+      - "2.4GHz": max of band=0
+      - "5GHz":   max of band=1
+      - "avg": average of band maxima
     """
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
+
     rows = []
     for ap in data:
         name = ap.get("name")
         client_count = ap.get("client_count", 0)
+        cpu_util = ap.get("cpu_utilization", 0)
+        mem_free = ap.get("mem_free", 0)
+        mem_total = ap.get("mem_total", 0)
         group_name = ap.get("group_name")
         site = ap.get("site")
-        cpu_utilization = ap.get("cpu_utilization")
-        mem_free = ap.get("mem_free")
-        mem_total = ap.get("mem_total")
-        
-        # Extract radio metrics with band filtering
         radios = ap.get("radios") or []
-        
-        if band_filter == "average":
-            # For average mode: compute average(max(5GHz), max(2.4GHz))
-            band_24ghz = []
-            band_5ghz = []
-            
-            for r in radios:
-                u = r.get("utilization")
-                band = r.get("band")
-                
-                if u is None:
-                    continue
-                
-                if band == 0:  # 2.4 GHz
-                    band_24ghz.append(u)
-                elif band == 1:  # 5 GHz
-                    band_5ghz.append(u)
-            
-            # Get max from each band
-            max_24 = max(band_24ghz) if band_24ghz else None
-            max_5 = max(band_5ghz) if band_5ghz else None
-            
-            # Calculate average of the max values
-            if max_24 is not None and max_5 is not None:
-                radio_util = (max_24 + max_5) / 2
-            elif max_24 is not None:
-                radio_util = max_24
-            elif max_5 is not None:
-                radio_util = max_5
-            else:
-                radio_util = None
-        else:
-            # For single band filters
-            radio_utils = []
-            
-            for r in radios:
-                u = r.get("utilization")
-                band = r.get("band")
-                
-                if u is None:
-                    continue
-                
-                # Apply band filter
-                if band_filter == "2.4GHz" and band != 0:
-                    continue
-                elif band_filter == "5GHz" and band != 1:
-                    continue
-                
-                radio_utils.append(u)
-            
-            # Use max for single band (in case AP has multiple radios on same band)
-            radio_util = max(radio_utils) if radio_utils else None
-        
-        rows.append({
-            "name": name,
-            "client_count": client_count,
-            "group_name": group_name,
-            "site": site,
-            "max_radio_util": radio_util,
-            "cpu_utilization": cpu_utilization,
-            "mem_free": mem_free,
-            "mem_total": mem_total,
-        })
-    
+
+        util_2g = []
+        util_5g = []
+        for r in radios:
+            u = r.get("utilization")
+            band = r.get("band")
+            if u is None:
+                continue
+            if band == 0:
+                util_2g.append(float(u))
+            elif band == 1:
+                util_5g.append(float(u))
+
+        max_2g = max(util_2g) if util_2g else np.nan
+        max_5g = max(util_5g) if util_5g else np.nan
+
+        if band_mode == "2.4GHz":
+            agg_util = max_2g
+        elif band_mode == "5GHz":
+            agg_util = max_5g
+        elif band_mode == "avg":
+            parts = [x for x in [max_2g, max_5g] if not np.isnan(x)]
+            agg_util = float(np.mean(parts)) if parts else np.nan
+        else:  # "worst"
+            agg_util = np.nanmax([max_2g, max_5g])
+
+        rows.append(
+            {
+                "name": name,
+                "group_name": group_name,
+                "site": site,
+                "client_count": pd.to_numeric(client_count, errors="coerce"),
+                "cpu_utilization": pd.to_numeric(cpu_util, errors="coerce"),
+                "mem_free": pd.to_numeric(mem_free, errors="coerce"),
+                "mem_total": pd.to_numeric(mem_total, errors="coerce"),
+                "util_2g": max_2g,
+                "util_5g": max_5g,
+                "agg_util": agg_util,
+            }
+        )
+
     df = pd.DataFrame(rows)
-    
-    # Sanitize numeric fields
-    # Note: max_radio_util None values (APs with no matching band radios) become 0
-    # These APs will have low conflictivity scores, which is appropriate since they
-    # don't have active radios on the selected band
-    numeric_cols = ["client_count", "max_radio_util", "cpu_utilization", "mem_free", "mem_total"]
-    for col in numeric_cols:
-        if col in df:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-    
-    # Calculate memory used percentage
-    if "mem_free" in df.columns and "mem_total" in df.columns:
-        df["mem_used_pct"] = ((1 - (df["mem_free"] / df["mem_total"]).clip(lower=0, upper=1)) * 100).fillna(0)
-    else:
-        df["mem_used_pct"] = 0
-    
-    # Build conflictivity score using algorithm adapted from ap_problem_analysis.ipynb
-    # with proper radio utilization interpretation
-    
-    # Radio Utilization Score (non-linear based on thresholds):
-    # < 20%: Good (score 0.0-0.3)
-    # 20-50%: Moderate (score 0.3-0.7)
-    # > 50%: High/Critical (score 0.7-1.0)
-    def radio_util_score(util):
-        """Convert radio utilization % to a problem score [0,1]"""
-        if util < 20:
-            # Light utilization: map 0-20% to 0.0-0.3
-            return (util / 20) * 0.3
-        elif util < 50:
-            # Moderate utilization: map 20-50% to 0.3-0.7
-            return 0.3 + ((util - 20) / 30) * 0.4
-        else:
-            # High utilization: map 50-100% to 0.7-1.0
-            return 0.7 + ((util - 50) / 50) * 0.3
-    
-    # Apply radio utilization scoring
-    df["util_score"] = df["max_radio_util"].apply(radio_util_score)
-    
-    # Normalize other metrics using norm01 (linear normalization)
-    df["load_norm"] = norm01(df["client_count"]) if len(df) > 0 else pd.Series(0, index=df.index)
-    df["cpu_norm"] = norm01(df["cpu_utilization"]) if len(df) > 0 else pd.Series(0, index=df.index)
-    df["mem_norm"] = norm01(df["mem_used_pct"]) if len(df) > 0 else pd.Series(0, index=df.index)
-    
-    # Weights adapted for AP-only data:
-    # - Radio utilization is our primary indicator (85%)
-    # - Client load adds context about demand (10%)
-    # - System resources (CPU + Mem) = 5%
-    
-    w_util = 0.85      # Radio utilization (primary metric)
-    w_load = 0.10      # Client load
-    w_cpu = 0.02       # CPU utilization
-    w_mem = 0.03       # Memory usage
-    
+
+    # Sanitize numerics
+    for c in ["client_count", "cpu_utilization", "mem_free", "mem_total", "util_2g", "util_5g", "agg_util"]:
+        if c in df:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Memory used %
+    df["mem_used_pct"] = (1 - (df["mem_free"] / df["mem_total"])).clip(0, 1) * 100
+    df["mem_used_pct"] = df["mem_used_pct"].fillna(0)
+
+    # Choose band weights for airtime score when both present
+    # 2.4 GHz counts more (noisy band)
+    w_2g = 0.6
+    w_5g = 0.4
+
+    # Airtime scores per band
+    df["air_s_2g"] = df["util_2g"].apply(lambda u: airtime_score(u, "2g") if not np.isnan(u) else np.nan)
+    df["air_s_5g"] = df["util_5g"].apply(lambda u: airtime_score(u, "5g") if not np.isnan(u) else np.nan)
+
+    # Aggregated airtime score:
+    # - worst mode: max of band scores (true worst case)
+    # - avg mode: weighted average of available band scores
+    if band_mode in ("2.4GHz", "5GHz"):
+        df["airtime_score"] = np.where(
+            band_mode == "2.4GHz", df["air_s_2g"], df["air_s_5g"]
+        )
+    elif band_mode == "avg":
+        df["airtime_score"] = (
+            (df["air_s_2g"].fillna(0) * w_2g + df["air_s_5g"].fillna(0) * w_5g)
+            / ((~df["air_s_2g"].isna()) * w_2g + (~df["air_s_5g"].isna()) * w_5g).replace(0, np.nan)
+        )
+    else:  # worst
+        df["airtime_score"] = np.nanmax(np.vstack([df["air_s_2g"].fillna(-1), df["air_s_5g"].fillna(-1)]), axis=0)
+        df["airtime_score"] = df["airtime_score"].where(df["airtime_score"] >= 0, np.nan)
+
+    # Client pressure normalized to snapshot 95th percentile
+    p95_clients = float(np.nanpercentile(df["client_count"].fillna(0), 95)) if len(df) else 1.0
+    df["client_score"] = df["client_count"].apply(lambda n: client_pressure_score(n, p95_clients))
+
+    # Resource health
+    df["cpu_score"] = df["cpu_utilization"].apply(cpu_health_score)
+    df["mem_score"] = df["mem_used_pct"].apply(mem_health_score)
+
+    # Idle-with-no-clients relief: if airtime is high but clients==0, reduce pain a bit
+    # This distinguishes neighbor interference from true contention under load.
+    def relief(a_score: float, clients: float) -> float:
+        if np.isnan(a_score):
+            return np.nan
+        if (clients or 0) > 0:
+            return a_score
+        # up to 20% relief when no clients
+        return a_score * 0.8
+
+    df["airtime_score_adj"] = [
+        relief(a, c) for a, c in zip(df["airtime_score"], df["client_count"])
+    ]
+
+    # Final conflictivity weights (sum ≈ 1.0)
+    W_AIR = 0.75   # channel busy/quality dominates
+    W_CL  = 0.15   # how many users we may hurt
+    W_CPU = 0.05   # AP CPU health
+    W_MEM = 0.05   # AP memory health
+
+    # Combine; missing airtime -> treat as 0.4 (neutral-ish) to avoid rewarding missing data
+    df["airtime_score_filled"] = df["airtime_score_adj"].fillna(0.4)
+
     df["conflictivity"] = (
-        df["util_score"] * w_util +
-        df["load_norm"] * w_load +
-        df["cpu_norm"] * w_cpu +
-        df["mem_norm"] * w_mem
-    ).clip(lower=0, upper=1)
-    
+        df["airtime_score_filled"] * W_AIR
+        + df["client_score"].fillna(0) * W_CL
+        + df["cpu_score"].fillna(0) * W_CPU
+        + df["mem_score"].fillna(0) * W_MEM
+    ).clip(0, 1)
+
+    # For display
+    df["max_radio_util"] = df["agg_util"].fillna(0)  # keep name expected by UI
     df["group_code"] = df["name"].apply(extract_group)
     return df
 
-
 def read_geoloc_points(geojson_path: Path) -> pd.DataFrame:
-    """Return DataFrame with columns: name, lon, lat (name from USER_NOM_A)."""
     with geojson_path.open("r", encoding="utf-8") as f:
         gj = json.load(f)
     feats = gj.get("features", [])
@@ -266,12 +286,10 @@ def read_geoloc_points(geojson_path: Path) -> pd.DataFrame:
     for ft in feats:
         props = (ft or {}).get("properties", {})
         geom = (ft or {}).get("geometry", {})
-        if not props or not geom:
+        if (geom or {}).get("type") != "Point":
             continue
-        if geom.get("type") != "Point":
-            continue
-        coords = geom.get("coordinates")
-        if not coords or len(coords) < 2:
+        coords = geom.get("coordinates") or []
+        if len(coords) < 2:
             continue
         name = props.get("USER_NOM_A")
         if not name:
@@ -280,90 +298,102 @@ def read_geoloc_points(geojson_path: Path) -> pd.DataFrame:
         rows.append({"name": name, "lon": lon, "lat": lat})
     return pd.DataFrame(rows)
 
-
-def aggregate_by_group(df: pd.DataFrame, geo_df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate AP rows into building group centroids and average conflictivity.
-    Returns: DataFrame with columns group_code, lat, lon, conflictivity, n_aps
-    """
-    ap_geo = df
-    # Ensure coordinates exist; if not, join once with geoloc
-    if not {"lat", "lon"}.issubset(ap_geo.columns):
-        ap_geo = ap_geo.merge(geo_df, on="name", how="inner")
-
-    # Derive group code if missing
-    if "group_code" not in ap_geo.columns:
-        ap_geo["group_code"] = ap_geo["name"].apply(extract_group)
-
-    # Keep only rows with valid group and coordinates
-    ap_geo = ap_geo.dropna(subset=["group_code", "lat", "lon"])  # keep valid
-    if ap_geo.empty:
-        return ap_geo
-
-    agg = (
-        ap_geo.groupby("group_code")
-        .agg(
-            lat=("lat", "mean"),
-            lon=("lon", "mean"),
-            conflictivity=("conflictivity", "mean"),
-            n_aps=("name", "count"),
-        )
-        .reset_index()
+def create_optimized_heatmap(
+    df: pd.DataFrame,
+    center_lat: float,
+    center_lon: float,
+    min_conflictivity: float = 0.0,
+    radius: int = 15,
+    zoom: int = 15,
+) -> go.Figure:
+    df_with_location = df.copy()
+    df_with_location["location_key"] = (
+        df_with_location["lat"].round(6).astype(str)
+        + ","
+        + df_with_location["lon"].round(6).astype(str)
     )
-    return agg
 
+    location_groups = df_with_location.groupby("location_key").agg(
+        lat=("lat", "first"),
+        lon=("lon", "first"),
+        name=("name", lambda x: list(x)),
+        conflictivity=("conflictivity", lambda x: list(x)),
+        client_count=("client_count", lambda x: list(x) if "client_count" in df.columns else None),
+        max_radio_util=("max_radio_util", lambda x: list(x) if "max_radio_util" in df.columns else None),
+    ).reset_index()
 
-def create_optimized_heatmap(df: pd.DataFrame, center_lat: float, center_lon: float, 
-                              min_conflictivity: float = 0.0, radius: int = 15, zoom: int = 15) -> go.Figure:
-    """Create an optimized heatmap with proper color representation per AP.
-    
-    Key features:
-    - Each AP shows its TRUE color based on its conflictivity value (no density averaging)
-    - APs below min_conflictivity have reduced opacity
-    - High conflictivity values render on top
-    - Color scale ALWAYS fixed to 0-1 range
-    """
-    # Sort by conflictivity DESCENDING so low values are plotted first,
-    # then high values (red) are plotted last and appear on top
-    df_sorted = df.sort_values('conflictivity', ascending=False).copy()
-    
-    # Calculate opacity based on threshold
-    # Full opacity for APs >= threshold, reduced for others
-    opacity_values = df_sorted['conflictivity'].apply(
+    location_groups["max_conflictivity"] = location_groups["conflictivity"].apply(max)
+    location_groups["ap_count"] = location_groups["name"].apply(len)
+    location_groups = location_groups.sort_values("max_conflictivity", ascending=True)
+
+    hover_texts = []
+    for _, row in location_groups.iterrows():
+        ap_data = sorted(
+            zip(
+                row["name"],
+                row["conflictivity"],
+                (row["client_count"] or [None] * len(row["name"])),
+                (row["max_radio_util"] or [None] * len(row["name"])),
+            ),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        if len(ap_data) == 1:
+            n, conf, cli, util = ap_data[0]
+            t = f"<b>{n}</b><br>Conflictivity: {conf:.3f}"
+            if cli is not None:
+                t += f"<br>Clients: {int(cli)}"
+            if util is not None and not np.isnan(util):
+                t += f"<br>Radio Util: {util:.1f}%"
+        else:
+            t = f"<b>{len(ap_data)} APs at this location</b><br><br>"
+            for i, (n, conf, cli, util) in enumerate(ap_data):
+                t += f"<b>{n}</b><br>  Conflictivity: {conf:.3f}"
+                if cli is not None:
+                    t += f" | Clients: {int(cli)}"
+                if util is not None and not np.isnan(util):
+                    t += f" | Radio: {util:.1f}%"
+                if i < len(ap_data) - 1:
+                    t += "<br>"
+        hover_texts.append(t)
+
+    opacity_values = location_groups["max_conflictivity"].apply(
         lambda x: 0.85 if x >= min_conflictivity else 0.15
     ).tolist()
-    
-    # Create scatter plot with individual colored markers
-    fig = go.Figure(go.Scattermapbox(
-        lat=df_sorted['lat'],
-        lon=df_sorted['lon'],
-        mode='markers',
-        marker=dict(
-            size=radius * 2,  # Convert radius to marker size
-            color=df_sorted['conflictivity'],
-            colorscale=[
-                [0.0, 'rgb(0, 255, 0)'],        # Green (low conflictivity)
-                [0.5, 'rgb(255, 165, 0)'],      # Orange (medium)
-                [1.0, 'rgb(255, 0, 0)']         # Red (high conflictivity)
-            ],
-            cmin=0,
-            cmax=1,
-            opacity=opacity_values,
-            showscale=True,
-            colorbar=dict(
-                title="Conflictivity",
-                thickness=15,
-                len=0.7,
-                tickmode='linear',
-                tick0=0,
-                dtick=0.2,
-                tickformat='.1f',
+
+    fig = go.Figure(
+        go.Scattermapbox(
+            lat=location_groups["lat"],
+            lon=location_groups["lon"],
+            mode="markers",
+            marker=dict(
+                size=radius * 2,
+                color=location_groups["max_conflictivity"],
+                colorscale=[
+                    [0.0, "rgb(0, 255, 0)"],
+                    [0.5, "rgb(255, 165, 0)"],
+                    [1.0, "rgb(255, 0, 0)"],
+                ],
+                cmin=0,
+                cmax=1,
+                opacity=opacity_values,
+                showscale=True,
+                colorbar=dict(
+                    title="Conflictivity",
+                    thickness=15,
+                    len=0.7,
+                    tickmode="linear",
+                    tick0=0,
+                    dtick=0.2,
+                    tickformat=".1f",
+                ),
             ),
-        ),
-        text=df_sorted['name'],
-        hovertemplate='<b>%{text}</b><br>Conflictivity: %{marker.color:.3f}<extra></extra>',
-        showlegend=False,
-    ))
-    
+            text=hover_texts,
+            hovertemplate="%{text}<extra></extra>",
+            showlegend=False,
+        )
+    )
+
     fig.update_layout(
         mapbox=dict(
             style="open-street-map",
@@ -373,9 +403,7 @@ def create_optimized_heatmap(df: pd.DataFrame, center_lat: float, center_lon: fl
         margin=dict(l=10, r=10, t=30, b=10),
         height=700,
     )
-    
     return fig
-
 
 # -------- UI --------
 st.set_page_config(page_title="UAB Wi‑Fi Conflictivity", page_icon="📶", layout="wide")
@@ -395,162 +423,112 @@ if not snapshots:
     st.warning("No AP snapshots found in realData/ap. Please add AP-info-v2-*.json files.")
     st.stop()
 
-# Load geolocation data once
 geo_df = read_geoloc_points(GEOJSON_PATH)
 
-# Sidebar: time slider and controls
+# Sidebar
 with st.sidebar:
     st.header("Time Navigation")
-    
-    # Time series slider
-    if len(snapshots) > 0:
-        # Default to latest
-        default_idx = len(snapshots) - 1
-        
-        # Create readable labels for the slider
-        time_labels = [dt.strftime("%Y-%m-%d %H:%M") for _, dt in snapshots]
-        
-        # Use slider for time selection
-        selected_idx = st.slider(
-            "Select Time",
-            min_value=0,
-            max_value=len(snapshots) - 1,
-            value=default_idx,
-            format="",
-            help="Slide to navigate through time series data"
-        )
-        
-        # Display selected timestamp prominently
-        selected_path, selected_dt = snapshots[selected_idx]
-        st.info(f"📅 **{selected_dt.strftime('%Y-%m-%d')}**\n\n⏰ **{selected_dt.strftime('%H:%M:%S')}**")
-        
-        # Show time range info
-        first_dt = snapshots[0][1]
-        last_dt = snapshots[-1][1]
-        total_snapshots = len(snapshots)
-        st.caption(f"Available data: {first_dt.strftime('%Y-%m-%d %H:%M')} to {last_dt.strftime('%Y-%m-%d %H:%M')}")
-        st.caption(f"Total snapshots: {total_snapshots}")
-    
+    default_idx = len(snapshots) - 1
+    selected_idx = st.slider(
+        "Select Time",
+        min_value=0,
+        max_value=len(snapshots) - 1,
+        value=default_idx,
+        format="",
+        help="Slide to navigate through time series data",
+    )
+    selected_path, selected_dt = snapshots[selected_idx]
+    st.info(f"📅 **{selected_dt.strftime('%Y-%m-%d')}**\n\n⏰ **{selected_dt.strftime('%H:%M:%S')}**")
+
+    first_dt = snapshots[0][1]
+    last_dt = snapshots[-1][1]
+    st.caption(f"Available data: {first_dt.strftime('%Y-%m-%d %H:%M')} to {last_dt.strftime('%Y-%m-%d %H:%M')}")
+    st.caption(f"Total snapshots: {len(snapshots)}")
+
     st.divider()
     st.header("Visualization Settings")
-    
-    # Frequency band selector
-    band_filter = st.radio(
-        "Frequency Band",
-        options=["average", "2.4GHz", "5GHz"],
+    band_mode = st.radio(
+        "Band Mode",
+        options=["worst", "avg", "2.4GHz", "5GHz"],
         index=0,
-        help="Select which frequency band to analyze:\n"
-             "• Average: avg(max(2.4GHz), max(5GHz))\n"
-             "• 2.4GHz: Only 2.4 GHz radios (band 0)\n"
-             "• 5GHz: Only 5 GHz radios (band 1)"
+        help="worst: max(max_2.4, max_5) • avg: weighted average of band maxima",
+        horizontal=True,
     )
-    
-    # Heatmap radius optimization (optimal value: 15)
-    radius = st.slider(
-        "Heatmap radius (px)", 
-        min_value=5, 
-        max_value=40, 
-        value=15,
-        help="Optimal value: 15px for clear AP differentiation"
-    )
-    
+    radius = 5  # Fixed heatmap radius
     min_conf = st.slider("Minimum conflictivity", 0.0, 1.0, 0.0, 0.01)
-    top_n = st.slider(
-        "Top N listing", 
-        5, 50, 15, step=5,
-        help="Number of most conflictive APs to show in the table below the map"
-    )
+    top_n = st.slider("Top N listing (table)", 5, 50, 15, step=5)
 
-# Load data for selected timestamp with band filter
-ap_df = read_ap_snapshot(selected_path, band_filter=band_filter)
-
-# Merge AP + geoloc - DON'T filter by min_conf yet (we need all data for consistent heatmap)
+# Load and compute
+ap_df = read_ap_snapshot(selected_path, band_mode=band_mode)
 merged = ap_df.merge(geo_df, on="name", how="inner")
-
 if merged.empty:
     st.info("No APs have geolocation data.")
     st.stop()
 
-# Optional group filter (by prefix code) derived from current data
+# Group filter
 available_groups = sorted({g for g in merged["name"].apply(extract_group).dropna().unique().tolist()})
 with st.sidebar:
     st.divider()
     st.header("Filters")
     selected_groups = st.multiselect(
-        "Filter by building code", 
-        options=available_groups, 
+        "Filter by building code",
+        options=available_groups,
         default=available_groups,
-        help="Select specific building codes to display"
     )
 
-# Apply group filter if selected
 if selected_groups:
     merged = merged[merged["name"].apply(extract_group).isin(selected_groups)]
-
 if merged.empty:
     st.info("No APs after applying group filter.")
     st.stop()
 
-# Prepare data for map (AP level aggregation only)
-# Keep ALL APs for consistent heatmap calculation
 map_df = merged.copy()
-
-if map_df.empty:
-    st.info("No data to display on the map.")
-    st.stop()
-
-# Center map
 center_lat = float(map_df["lat"].mean())
 center_lon = float(map_df["lon"].mean())
 
-# Create optimized heatmap with ALL data, using min_conf for opacity control
 fig = create_optimized_heatmap(
     df=map_df,
     center_lat=center_lat,
     center_lon=center_lon,
     min_conflictivity=min_conf,
     radius=radius,
-    zoom=15
+    zoom=15,
 )
-
 st.plotly_chart(fig, use_container_width=True)
 
-
-# Top conflictive listing - filter here for the table
+# Top list
 st.subheader("Top conflictive Access Points")
-# Filter by minimum conflictivity for the table display
 filtered_for_table = map_df[map_df["conflictivity"] >= min_conf].copy()
-
 if filtered_for_table.empty:
     st.info(f"No APs with conflictivity >= {min_conf:.2f}")
 else:
-    cols = [c for c in ["name", "group_code", "client_count", "max_radio_util", "conflictivity"] if c in filtered_for_table.columns]
-    tmp = filtered_for_table[cols].copy()
-    if "group_code" not in tmp.columns:
-        tmp["group_code"] = tmp["name"].apply(extract_group)
-    top_df = tmp.sort_values("conflictivity", ascending=False).head(top_n)
-    top_df = top_df.rename(columns={"name": "Access Point", "group_code": "Building", "conflictivity": "Conflictivity Score"})
-    if "client_count" in top_df.columns:
-        top_df = top_df.rename(columns={"client_count": "Clients"})
-    if "max_radio_util" in top_df.columns:
-        top_df = top_df.rename(columns={"max_radio_util": "Max Radio Util %"})
-        
-    # Format the score column
-    if "Conflictivity Score" in top_df.columns:
-        top_df["Conflictivity Score"] = top_df["Conflictivity Score"].map(lambda x: f"{x:.3f}")
-        
+    cols = ["name", "group_code", "client_count", "max_radio_util", "conflictivity"]
+    cols = [c for c in cols if c in filtered_for_table.columns]
+    top_df = (
+        filtered_for_table[cols]
+        .sort_values("conflictivity", ascending=False)
+        .head(top_n)
+        .rename(
+            columns={
+                "name": "Access Point",
+                "group_code": "Building",
+                "conflictivity": "Conflictivity Score",
+                "client_count": "Clients",
+                "max_radio_util": "Radio Util % (agg)",
+            }
+        )
+    )
+    top_df["Conflictivity Score"] = top_df["Conflictivity Score"].map(lambda x: f"{x:.3f}")
     st.dataframe(top_df, use_container_width=True, hide_index=True)
 
-
-# Footer
 band_info = {
-    "average": "All bands (average)",
+    "worst": "Worst band (max of 2.4/5 GHz)",
+    "avg": "Weighted average of band maxima (2.4:60%, 5:40%)",
     "2.4GHz": "2.4 GHz only",
-    "5GHz": "5 GHz only"
+    "5GHz": "5 GHz only",
 }
 st.caption(
-    f"📻 **Band:** {band_info[band_filter]}  |  "
-    "💡 **Conflictivity:** 85% radio_util (threshold-based) + 10% client_load + 2% cpu + 3% memory  |  "
-    "📡 **Radio Util:** <20% good, 20-50% moderate, >50% high  |  "
-    "🎨 **Colors:** 🟢 Green (Low) → 🟠 Orange (Medium) → 🔴 Red (High)"
+    f"📻 Band mode: {band_info[band_mode]}  |  "
+    "💡 Conflictivity measures Wi-Fi stress by combining channel congestion (75%), number of connected devices (15%), and AP resource usage (10%)  |  "
+    "🟢 Low ↔ 🔴 High (0–1)"
 )
