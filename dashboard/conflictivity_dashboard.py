@@ -1,25 +1,24 @@
 """
-Static Conflictivity Dashboard (UI-first)
+Enhanced Conflictivity Dashboard with Time Series Navigation
 
 Purpose
-- Show a heatmap of Wi-Fi conflictivity by place on the UAB campus using the latest snapshot in realData/ap/.
-- No live API yet; focuses on polished UI and local snapshot selection.
+- Show a heatmap of Wi-Fi conflictivity by AP on the UAB campus with time series navigation.
+- Improved visualization with proper color layering and optimized heatmap display.
 
 Data sources
 - AP snapshots: realData/ap/AP-info-v2-*.json (fields include name, client_count, radios[].utilization, group_name, etc.)
 - AP geolocations: realData/geoloc/aps_geolocalizados_wgs84.geojson (properties.USER_NOM_A = AP name, geometry.coordinates = [lon, lat])
 
-Conflictivity metric (static assumption)
+Conflictivity metric
 - Combine client load and radio utilization per AP into a [0,1] score:
   score = 0.6 * norm01(client_count) + 0.4 * max_radio_utilization/100
 - When min=max for client_count, use 0.5 for that component.
-- For "place" aggregation, we use the AP name prefix (e.g., AP-VET71 -> VET) and compute the mean score per group.
 
 UI features
-- Snapshot selector (auto-selects latest on load)
-- Aggregation: APs vs Buildings (group prefix)
-- Map type: Heatmap vs Points
-- Filters: group prefix, minimum conflictivity threshold, heatmap radius
+- Time series slider to navigate through snapshots chronologically
+- Aggregation by AP (default and only option)
+- Optimized heatmap visualization with proper color layering
+- Filters: group prefix, minimum conflictivity threshold
 - Top N most conflictive table
 
 Run
@@ -32,9 +31,11 @@ import json
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from datetime import datetime
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 
@@ -62,8 +63,23 @@ def extract_group(ap_name: Optional[str]) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def find_snapshot_files(ap_dir: Path) -> List[Path]:
-    return sorted(ap_dir.glob("AP-info-v2-*.json"))
+def find_snapshot_files(ap_dir: Path) -> List[Tuple[Path, datetime]]:
+    """Find all snapshot files and parse their timestamps.
+    Returns list of (path, datetime) tuples sorted by time."""
+    files = list(ap_dir.glob("AP-info-v2-*.json"))
+    files_with_time = []
+    
+    for f in files:
+        # Parse timestamp from filename: AP-info-v2-2025-04-03T00_00_01+02_00.json
+        match = re.search(r'(\d{4})-(\d{2})-(\d{2})T(\d{2})_(\d{2})_(\d{2})', f.name)
+        if match:
+            year, month, day, hour, minute, second = map(int, match.groups())
+            dt = datetime(year, month, day, hour, minute, second)
+            files_with_time.append((f, dt))
+    
+    # Sort by datetime
+    files_with_time.sort(key=lambda x: x[1])
+    return files_with_time
 
 
 def read_ap_snapshot(path: Path) -> pd.DataFrame:
@@ -161,10 +177,56 @@ def aggregate_by_group(df: pd.DataFrame, geo_df: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
+def create_optimized_heatmap(df: pd.DataFrame, center_lat: float, center_lon: float, 
+                              radius: int = 15, zoom: int = 15) -> go.Figure:
+    """Create an optimized heatmap with proper color layering (high values on top).
+    
+    The key improvement is sorting data so high conflictivity values are rendered last,
+    ensuring they appear on top of lower values.
+    """
+    # Sort by conflictivity so high values are plotted last (on top)
+    df_sorted = df.sort_values('conflictivity', ascending=True).copy()
+    
+    # Create figure with density mapbox
+    fig = go.Figure(go.Densitymapbox(
+        lat=df_sorted['lat'],
+        lon=df_sorted['lon'],
+        z=df_sorted['conflictivity'],
+        radius=radius,
+        colorscale=[
+            [0.0, 'rgb(0, 255, 0)'],      # Green (low conflictivity)
+            [0.5, 'rgb(255, 255, 0)'],    # Yellow (medium)
+            [1.0, 'rgb(255, 0, 0)']       # Red (high conflictivity)
+        ],
+        showscale=True,
+        colorbar=dict(
+            title="Conflictivity",
+            thickness=15,
+            len=0.7,
+        ),
+        hovertemplate='<b>%{text}</b><br>Conflictivity: %{z:.2f}<extra></extra>',
+        text=df_sorted['name'],
+        zmin=0,
+        zmax=1,
+    ))
+    
+    fig.update_layout(
+        mapbox=dict(
+            style="open-street-map",
+            center=dict(lat=center_lat, lon=center_lon),
+            zoom=zoom,
+        ),
+        margin=dict(l=10, r=10, t=30, b=10),
+        height=700,
+    )
+    
+    return fig
+
+
 # -------- UI --------
 st.set_page_config(page_title="UAB Wi‑Fi Conflictivity", page_icon="📶", layout="wide")
 st.title("UAB Wi‑Fi Conflictivity Dashboard")
-st.caption("Static prototype • Heatmap of conflictivity by place (AP or Building)")
+st.caption("Time series visualization • Heatmap of conflictivity by Access Point")
 
 # Data availability checks
 if not AP_DIR.exists():
@@ -179,23 +241,58 @@ if not snapshots:
     st.warning("No AP snapshots found in realData/ap. Please add AP-info-v2-*.json files.")
     st.stop()
 
-# Sidebar: snapshot selector and controls
-with st.sidebar:
-    st.header("Controls")
-    # Default to latest lexicographically (matches timestamp in filename pattern)
-    default_idx = len(snapshots) - 1
-    snap_labels = [p.name for p in snapshots]
-    snap_choice = st.selectbox("Snapshot", options=range(len(snapshots)), format_func=lambda i: snap_labels[i], index=default_idx)
-    selected_path = snapshots[snap_choice]
+# Load geolocation data once
+geo_df = read_geoloc_points(GEOJSON_PATH)
 
-    agg_level = st.radio("Aggregation", options=["APs", "Buildings"], index=1, help="Show individual APs or building-level centroids")
-    map_type = st.radio("Map type", options=["Heatmap", "Points"], index=0)
+# Sidebar: time slider and controls
+with st.sidebar:
+    st.header("Time Navigation")
+    
+    # Time series slider
+    if len(snapshots) > 0:
+        # Default to latest
+        default_idx = len(snapshots) - 1
+        
+        # Create readable labels for the slider
+        time_labels = [dt.strftime("%Y-%m-%d %H:%M") for _, dt in snapshots]
+        
+        # Use slider for time selection
+        selected_idx = st.slider(
+            "Select Time",
+            min_value=0,
+            max_value=len(snapshots) - 1,
+            value=default_idx,
+            format="",
+            help="Slide to navigate through time series data"
+        )
+        
+        # Display selected timestamp prominently
+        selected_path, selected_dt = snapshots[selected_idx]
+        st.info(f"📅 **{selected_dt.strftime('%Y-%m-%d')}**\n\n⏰ **{selected_dt.strftime('%H:%M:%S')}**")
+        
+        # Show time range info
+        first_dt = snapshots[0][1]
+        last_dt = snapshots[-1][1]
+        total_snapshots = len(snapshots)
+        st.caption(f"Available data: {first_dt.strftime('%Y-%m-%d %H:%M')} to {last_dt.strftime('%Y-%m-%d %H:%M')}")
+        st.caption(f"Total snapshots: {total_snapshots}")
+    
+    st.divider()
+    st.header("Visualization Settings")
+    
+    # Heatmap radius optimization (optimal value: 15)
+    radius = st.slider(
+        "Heatmap radius (px)", 
+        min_value=5, 
+        max_value=40, 
+        value=15,
+        help="Optimal value: 15px for clear AP differentiation"
+    )
+    
     min_conf = st.slider("Minimum conflictivity", 0.0, 1.0, 0.0, 0.01)
-    radius = st.slider("Heatmap radius (px)", 5, 60, 25) if map_type == "Heatmap" else None
     top_n = st.slider("Top N listing", 5, 50, 15, step=5)
 
-# Load data
-geo_df = read_geoloc_points(GEOJSON_PATH)
+# Load data for selected timestamp
 ap_df = read_ap_snapshot(selected_path)
 
 # Merge AP + geoloc and filter
@@ -209,7 +306,14 @@ if merged.empty:
 # Optional group filter (by prefix code) derived from current data
 available_groups = sorted({g for g in merged["name"].apply(extract_group).dropna().unique().tolist()})
 with st.sidebar:
-    selected_groups = st.multiselect("Filter by building code", options=available_groups, default=available_groups)
+    st.divider()
+    st.header("Filters")
+    selected_groups = st.multiselect(
+        "Filter by building code", 
+        options=available_groups, 
+        default=available_groups,
+        help="Select specific building codes to display"
+    )
 
 if selected_groups:
     merged = merged[merged["name"].apply(extract_group).isin(selected_groups)]
@@ -218,81 +322,51 @@ if merged.empty:
     st.info("No APs after applying group filter.")
     st.stop()
 
-
-# Prepare data for map
-if agg_level == "Buildings":
-    map_df = aggregate_by_group(merged, geo_df)
-    lat_col, lon_col, z_col, hover_name = "lat", "lon", "conflictivity", "group_code"
-else:
-    map_df = merged.copy()
-    lat_col, lon_col, z_col, hover_name = "lat", "lon", "conflictivity", "name"
+# Prepare data for map (AP level aggregation only)
+map_df = merged.copy()
 
 if map_df.empty:
     st.info("No data to display on the map.")
     st.stop()
 
-
 # Center map
-center_lat = float(map_df[lat_col].mean())
-center_lon = float(map_df[lon_col].mean())
+center_lat = float(map_df["lat"].mean())
+center_lon = float(map_df["lon"].mean())
 
-# Color scale: red (high conflict) -> yellow -> green (low). We'll invert RdYlGn
-colorscale = "RdYlGn_r"
-zoom = 14 if agg_level == "Buildings" else 15
+# Create optimized heatmap
+fig = create_optimized_heatmap(
+    df=map_df,
+    center_lat=center_lat,
+    center_lon=center_lon,
+    radius=radius,
+    zoom=15
+)
 
-if map_type == "Heatmap":
-    fig = px.density_mapbox(
-        map_df,
-        lat=lat_col,
-        lon=lon_col,
-        z=z_col,
-        radius=radius or 25,
-        center=dict(lat=center_lat, lon=center_lon),
-        zoom=zoom,
-        height=700,
-        color_continuous_scale=colorscale,
-    )
-else:
-    size_col = "client_count" if "client_count" in map_df.columns else z_col
-    fig = px.scatter_mapbox(
-        map_df,
-        lat=lat_col,
-        lon=lon_col,
-        color=z_col,
-        size=size_col,
-        hover_name=hover_name,
-        hover_data={
-            "conflictivity": ":.2f",
-            "client_count": True if "client_count" in map_df.columns else False,
-            "max_radio_util": True if "max_radio_util" in map_df.columns else False,
-        },
-        color_continuous_scale=colorscale,
-        height=700,
-        zoom=zoom,
-    )
-
-fig.update_layout(mapbox_style="open-street-map", margin=dict(l=10, r=10, t=30, b=10))
 st.plotly_chart(fig, use_container_width=True)
 
 
 # Top conflictive listing
-st.subheader("Top conflictive places")
-if agg_level == "Buildings":
-    top_df = map_df[["group_code", "conflictivity"]].sort_values("conflictivity", ascending=False).head(top_n)
-    top_df = top_df.rename(columns={"group_code": "place", "conflictivity": "score"})
-else:
-    cols = [c for c in ["name", "group_code", "client_count", "max_radio_util", "conflictivity"] if c in map_df.columns]
-    tmp = map_df[cols].copy()
-    if "group_code" not in tmp.columns:
-        tmp["group_code"] = tmp["name"].apply(extract_group)
-    top_df = tmp.sort_values("conflictivity", ascending=False).head(top_n)
-    top_df = top_df.rename(columns={"name": "place", "conflictivity": "score"})
-top_df["score"] = top_df["score"].map(lambda x: f"{x:.2f}")
-st.dataframe(top_df, use_container_width=True)
+st.subheader("Top conflictive Access Points")
+cols = [c for c in ["name", "group_code", "client_count", "max_radio_util", "conflictivity"] if c in map_df.columns]
+tmp = map_df[cols].copy()
+if "group_code" not in tmp.columns:
+    tmp["group_code"] = tmp["name"].apply(extract_group)
+top_df = tmp.sort_values("conflictivity", ascending=False).head(top_n)
+top_df = top_df.rename(columns={"name": "Access Point", "group_code": "Building", "conflictivity": "Conflictivity Score"})
+if "client_count" in top_df.columns:
+    top_df = top_df.rename(columns={"client_count": "Clients"})
+if "max_radio_util" in top_df.columns:
+    top_df = top_df.rename(columns={"max_radio_util": "Max Radio Util %"})
+    
+# Format the score column
+if "Conflictivity Score" in top_df.columns:
+    top_df["Conflictivity Score"] = top_df["Conflictivity Score"].map(lambda x: f"{x:.3f}")
+    
+st.dataframe(top_df, use_container_width=True, hide_index=True)
 
 
 # Footer
 st.caption(
-    "Conflictivity = 0.6 · normalized clients + 0.4 · max radio utilization. "
-    "When clients are constant across APs, that component becomes 0.5."
+    "💡 **Conflictivity Formula:** 0.6 × normalized_clients + 0.4 × max_radio_utilization  |  "
+    "🎨 **Color Scale:** 🟢 Green (Low) → 🟡 Yellow (Medium) → 🔴 Red (High)"
 )
