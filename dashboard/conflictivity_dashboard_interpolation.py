@@ -27,7 +27,8 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from shapely.geometry import Point, MultiPoint
+from shapely.geometry import Point, MultiPoint, LineString, Polygon
+from shapely.ops import unary_union, linemerge
 from matplotlib.path import Path as MplPath
 # No sklearn dependency: custom kernel-based interpolation
 
@@ -70,38 +71,127 @@ def find_snapshot_files(ap_dir: Path) -> List[Tuple[Path, datetime]]:
     return files_with_time
 
 
-def read_ap_snapshot(path: Path) -> pd.DataFrame:
-    """Load one AP snapshot JSON into a DataFrame with selected fields and conflictivity."""
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def airtime_score(util: float, band: str) -> float:
+    """Misma funció que l'altre dashboard: mapatge de utilització a [0,1] diferenciat per banda."""
+    u = clamp(util or 0.0, 0.0, 100.0)
+    if band == "2g":
+        if u <= 10: return 0.05 * (u / 10.0)
+        if u <= 25: return 0.05 + 0.35 * ((u - 10) / 15.0)
+        if u <= 50: return 0.40 + 0.35 * ((u - 25) / 25.0)
+        return 0.75 + 0.25 * ((u - 50) / 50.0)
+    else:  # 5g
+        if u <= 15: return 0.05 * (u / 15.0)
+        if u <= 35: return 0.05 + 0.35 * ((u - 15) / 20.0)
+        if u <= 65: return 0.40 + 0.35 * ((u - 35) / 30.0)
+        return 0.75 + 0.25 * ((u - 65) / 35.0)
+
+def client_pressure_score(n_clients: float, peers_p95: float) -> float:
+    n = max(0.0, float(n_clients or 0.0))
+    denom = max(1.0, float(peers_p95 or 1.0))
+    import math
+    x = math.log1p(n) / math.log1p(denom)
+    return clamp(x, 0.0, 1.0)
+
+def cpu_health_score(cpu_pct: float) -> float:
+    c = clamp(cpu_pct or 0.0, 0.0, 100.0)
+    if c <= 70: return 0.0
+    if c <= 90: return 0.6 * ((c - 70) / 20.0)
+    return 0.6 + 0.4 * ((c - 90) / 10.0)
+
+def mem_health_score(mem_used_pct: float) -> float:
+    m = clamp(mem_used_pct or 0.0, 0.0, 100.0)
+    if m <= 80: return 0.0
+    if m <= 95: return 0.6 * ((m - 80) / 15.0)
+    return 0.6 + 0.4 * ((m - 95) / 5.0)
+
+def read_ap_snapshot(path: Path, band_mode: str = "worst") -> pd.DataFrame:
+    """Llegir snapshot i calcular conflictivity avançada coherent amb l'altre dashboard."""
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
     rows = []
     for ap in data:
         name = ap.get("name")
-        client_count = ap.get("client_count")
+        client_count = ap.get("client_count", 0)
+        cpu_util = ap.get("cpu_utilization", 0)
+        mem_free = ap.get("mem_free", 0)
+        mem_total = ap.get("mem_total", 0)
         group_name = ap.get("group_name")
         site = ap.get("site")
         radios = ap.get("radios") or []
-        max_util = None
+        util_2g = []
+        util_5g = []
         for r in radios:
             u = r.get("utilization")
-            if u is None:
-                continue
-            max_util = u if max_util is None else max(max_util, u)
+            b = r.get("band")
+            if u is None: continue
+            if b == 0: util_2g.append(float(u))
+            elif b == 1: util_5g.append(float(u))
+        max_2g = max(util_2g) if util_2g else np.nan
+        max_5g = max(util_5g) if util_5g else np.nan
+        if band_mode == "2.4GHz":
+            agg_util = max_2g
+        elif band_mode == "5GHz":
+            agg_util = max_5g
+        elif band_mode == "avg":
+            vals = [x for x in [max_2g, max_5g] if not np.isnan(x)]
+            agg_util = float(np.mean(vals)) if vals else np.nan
+        else:  # worst
+            agg_util = np.nanmax([max_2g, max_5g])
         rows.append({
             "name": name,
-            "client_count": client_count,
             "group_name": group_name,
             "site": site,
-            "max_radio_util": max_util,
+            "client_count": client_count,
+            "cpu_utilization": cpu_util,
+            "mem_free": mem_free,
+            "mem_total": mem_total,
+            "util_2g": max_2g,
+            "util_5g": max_5g,
+            "agg_util": agg_util,
         })
     df = pd.DataFrame(rows)
-    if "client_count" in df:
-        df["client_count"] = pd.to_numeric(df["client_count"], errors="coerce").fillna(0)
-    if "max_radio_util" in df:
-        df["max_radio_util"] = pd.to_numeric(df["max_radio_util"], errors="coerce").fillna(0)
-    df["client_norm"] = norm01(df["client_count"]) if len(df) else []
-    df["util_norm"] = df["max_radio_util"].clip(lower=0, upper=100) / 100.0
-    df["conflictivity"] = 0.6 * df["client_norm"] + 0.4 * df["util_norm"]
+    # Sanitize
+    num_cols = ["client_count","cpu_utilization","mem_free","mem_total","util_2g","util_5g","agg_util"]
+    for c in num_cols:
+        if c in df: df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["mem_used_pct"] = (1 - (df["mem_free"] / df["mem_total"])).clip(0,1) * 100
+    df["mem_used_pct"] = df["mem_used_pct"].fillna(0)
+    # Airtime scores per band
+    df["air_s_2g"] = df["util_2g"].apply(lambda u: airtime_score(u, "2g") if not np.isnan(u) else np.nan)
+    df["air_s_5g"] = df["util_5g"].apply(lambda u: airtime_score(u, "5g") if not np.isnan(u) else np.nan)
+    w_2g, w_5g = 0.6, 0.4
+    if band_mode in ("2.4GHz","5GHz"):
+        df["airtime_score"] = np.where(band_mode=="2.4GHz", df["air_s_2g"], df["air_s_5g"])
+    elif band_mode == "avg":
+        df["airtime_score"] = (
+            (df["air_s_2g"].fillna(0)*w_2g + df["air_s_5g"].fillna(0)*w_5g) /
+            ((~df["air_s_2g"].isna())*w_2g + (~df["air_s_5g"].isna())*w_5g).replace(0,np.nan)
+        )
+    else:
+        df["airtime_score"] = np.nanmax(np.vstack([df["air_s_2g"].fillna(-1), df["air_s_5g"].fillna(-1)]), axis=0)
+        df["airtime_score"] = df["airtime_score"].where(df["airtime_score"]>=0, np.nan)
+    # Clients percentile
+    p95 = float(np.nanpercentile(df["client_count"].fillna(0),95)) if len(df) else 1.0
+    df["client_score"] = df["client_count"].apply(lambda n: client_pressure_score(n,p95))
+    df["cpu_score"] = df["cpu_utilization"].apply(cpu_health_score)
+    df["mem_score"] = df["mem_used_pct"].apply(mem_health_score)
+    # Relief si 0 clients
+    def relief(a,c):
+        if np.isnan(a): return np.nan
+        if (c or 0)>0: return a
+        return a*0.8
+    df["airtime_score_adj"] = [relief(a,c) for a,c in zip(df["airtime_score"], df["client_count"])]
+    # Ponderacions ajustades
+    W_AIR, W_CL, W_CPU, W_MEM = 0.85, 0.10, 0.02, 0.03
+    df["airtime_score_filled"] = df["airtime_score_adj"].fillna(0.4)
+    df["conflictivity"] = (
+        df["airtime_score_filled"]*W_AIR + df["client_score"].fillna(0)*W_CL +
+        df["cpu_score"].fillna(0)*W_CPU + df["mem_score"].fillna(0)*W_MEM
+    ).clip(0,1)
+    df["max_radio_util"] = df["agg_util"].fillna(0)
     df["group_code"] = df["name"].apply(extract_group)
     return df
 
@@ -249,115 +339,227 @@ def _add_density_layer(fig: go.Figure, lon_grid, lat_grid, Z, *, name: str,
     ))
 
 
-def _weighted_voronoi_tiled_layer(
-    df: pd.DataFrame,
-    *,
-    tile_meters: float = 3.0,
-    radius_m: float = 25.0,
-    weight_col: str = "connectivity_norm",
-    max_tiles: int = 40000,
-    colorscale=None,
-    name: str = "AWVD"
-):
-    """Approximate additively weighted Voronoi (Apollonius) via tile assignment inside hull.
+def _inverted_weighted_voronoi_edges(df: pd.DataFrame, *, weight_col: str = "conflictivity",
+                                     radius_m: float = 25.0, clip_polygon=None,
+                                     tolerance_m: float = 8.0):
+    """Compute an approximate additively weighted Voronoi graph (edges only) by:
+    1. Invert weights: w' = 1 - norm(weight_col)
+       (Baixa connectivitat => pes alt => cel·la gran en diagrama additiu.)
+    2. Use SciPy Voronoi (unweighted) on AP coordinates as a geometric scaffold.
+    3. Adjust edge inclusion heuristically by comparing additive distances of the two sites.
 
-    For each tile center x, assign owner i = argmin_j ( d(x, p_j) - w_j * radius_m ),
-    where w_j in [0,1] comes from df[weight_col]. Returns a Choroplethmapbox trace with
-    each tile colored by the owner's weight.
-
-    Returns: (choropleth_trace, effective_tile_meters, hull_polygon)
+    Returns list of edge segments (lon1, lat1, lon2, lat2).
     """
-    if colorscale is None:
-        colorscale = [[0.0, 'rgb(0, 0, 255)'], [0.5, 'rgb(100, 200, 255)'], [1.0, 'rgb(0, 255, 255)']]
-
     if df.empty or weight_col not in df.columns:
-        return None, tile_meters, None
+        return []
+    pts_lon = df["lon"].to_numpy(dtype=float)
+    pts_lat = df["lat"].to_numpy(dtype=float)
+    base = pd.to_numeric(df[weight_col], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    # Normalització i inversió
+    mn, mx = float(base.min()), float(base.max())
+    norm = (base - mn) / (mx - mn + 1e-12)
+    inv_w = 1.0 - norm  # baixa connectivitat -> valor gran
 
+    if len(pts_lon) < 3:
+        return []
+    try:
+        from scipy.spatial import Voronoi
+    except Exception:
+        return []
+    pts = np.column_stack([pts_lon, pts_lat])
+    # Ensure uniqueness to avoid Qhull errors: jitter duplicates slightly
+    try:
+        uniq, counts = np.unique(pts, axis=0, return_counts=True)
+        if np.any(counts > 1):
+            rng = np.random.RandomState(0)
+            pts = pts + rng.randn(*pts.shape) * 1e-8
+    except Exception:
+        pass
+    vor = Voronoi(pts)
+
+    edges = []
+    for (p1, p2), rv in zip(vor.ridge_points, vor.ridge_vertices):
+        if -1 not in rv:
+            # Finite edge
+            vcoords = vor.vertices[rv]  # shape (2,2)
+            lon1, lat1 = vcoords[0]
+            lon2, lat2 = vcoords[1]
+            # Heuristic: keep edge if additive distance ordering between p1 and p2 is stable
+            mid_lon = (lon1 + lon2) / 2.0
+            mid_lat = (lat1 + lat2) / 2.0
+            d1 = _haversine_m(mid_lat, mid_lon, pts_lat[p1], pts_lon[p1])
+            d2 = _haversine_m(mid_lat, mid_lon, pts_lat[p2], pts_lon[p2])
+            ad1 = d1 - inv_w[p1] * max(radius_m, 1e-6)
+            ad2 = d2 - inv_w[p2] * max(radius_m, 1e-6)
+            if abs(ad1 - ad2) < tolerance_m:  # tolerance (m)
+                edges.append((lon1, lat1, lon2, lat2))
+        else:
+            # Infinite edge: extend ray to boundary and clip
+            # Identify finite vertex
+            vs = [v for v in rv if v != -1]
+            if not vs:
+                continue
+            v0 = vor.vertices[vs[0]]
+            lon0, lat0 = float(v0[0]), float(v0[1])
+            # Direction: perpendicular to segment p2-p1
+            p1_xy = pts[[p1]][0]
+            p2_xy = pts[[p2]][0]
+            t = p2_xy - p1_xy
+            dir_vec = np.array([t[1], -t[0]], dtype=float)
+            nrm = np.linalg.norm(dir_vec)
+            if nrm == 0:
+                continue
+            dir_vec /= nrm
+            center = pts.mean(axis=0)
+            mid = (p1_xy + p2_xy) / 2.0
+            # Orient away from center
+            if np.dot(mid - center, dir_vec) < 0:
+                dir_vec *= -1.0
+            # Build a long segment and intersect with clip polygon
+            if clip_polygon is None:
+                # No boundary to clip against; skip to avoid unbounded lines
+                continue
+            minx, miny, maxx, maxy = clip_polygon.bounds
+            L = max(maxx - minx, maxy - miny) * 5.0 + 1e-6
+            far = np.array([lon0, lat0]) + dir_vec * L
+            ray = LineString([(lon0, lat0), (float(far[0]), float(far[1]))])
+            inter = ray.intersection(clip_polygon)
+            if inter.is_empty:
+                continue
+            def _add_segment_from_linestring(ls):
+                coords = list(ls.coords)
+                if len(coords) >= 2:
+                    a, b = coords[0], coords[-1]
+                    # Additive heuristic at segment midpoint
+                    mid_lon = (a[0] + b[0]) / 2.0
+                    mid_lat = (a[1] + b[1]) / 2.0
+                    d1 = _haversine_m(mid_lat, mid_lon, pts_lat[p1], pts_lon[p1])
+                    d2 = _haversine_m(mid_lat, mid_lon, pts_lat[p2], pts_lon[p2])
+                    ad1 = d1 - inv_w[p1] * max(radius_m, 1e-6)
+                    ad2 = d2 - inv_w[p2] * max(radius_m, 1e-6)
+                    if abs(ad1 - ad2) < tolerance_m:
+                        edges.append((a[0], a[1], b[0], b[1]))
+            if inter.geom_type == 'LineString':
+                _add_segment_from_linestring(inter)
+            elif inter.geom_type == 'MultiLineString':
+                for ls in inter.geoms:
+                    _add_segment_from_linestring(ls)
+
+    # Optional clipping: trim segments to the clip polygon
+    if clip_polygon is not None:
+        clipped = []
+        for (x1, y1, x2, y2) in edges:
+            seg = LineString([(x1, y1), (x2, y2)])
+            inter = seg.intersection(clip_polygon)
+            if inter.is_empty:
+                continue
+            if inter.geom_type == 'LineString':
+                coords = list(inter.coords)
+                if len(coords) >= 2:
+                    (ax, ay), (bx, by) = coords[0], coords[-1]
+                    clipped.append((ax, ay, bx, by))
+            elif inter.geom_type == 'MultiLineString':
+                for seg2 in inter.geoms:
+                    coords = list(seg2.coords)
+                    if len(coords) >= 2:
+                        (ax, ay), (bx, by) = coords[0], coords[-1]
+                        clipped.append((ax, ay, bx, by))
+        edges = clipped
+    return edges
+
+
+def _compute_connectivity_components(df: pd.DataFrame, radius_m: float) -> list[tuple[pd.DataFrame, object]]:
+    """Split APs into connected components under a distance threshold radius_m.
+    Returns a list of tuples: (sub_df, hull_polygon). Components with < 3 points are included
+    but their hull may be None; callers can skip them for Voronoi edges.
+    """
+    if df.empty:
+        return []
     lons = df["lon"].to_numpy(dtype=float)
     lats = df["lat"].to_numpy(dtype=float)
-    weights = pd.to_numeric(df[weight_col], errors="coerce").fillna(0.0).to_numpy(dtype=float)
-    weights = np.clip(weights, 0.0, 1.0)
+    n = len(lons)
+    if n == 0:
+        return []
+    # Pairwise distances
+    D = _haversine_m(lats[:, None], lons[:, None], lats[None, :], lons[None, :])
+    adj = (D <= max(radius_m, 1e-6)) & (~np.eye(n, dtype=bool))
+    visited = np.zeros(n, dtype=bool)
+    comps = []
+    for i in range(n):
+        if visited[i]:
+            continue
+        # BFS/DFS
+        stack = [i]
+        visited[i] = True
+        idxs = [i]
+        while stack:
+            u = stack.pop()
+            neighbors = np.where(adj[u])[0]
+            for v in neighbors:
+                if not visited[v]:
+                    visited[v] = True
+                    stack.append(v)
+                    idxs.append(v)
+        sub = df.iloc[idxs].copy()
+        hull = None
+        if len(idxs) >= 3:
+            hull = _compute_convex_hull_polygon(sub["lon"].to_numpy(float), sub["lat"].to_numpy(float))
+        comps.append((sub, hull))
+    return comps
 
-    hull_poly = _compute_convex_hull_polygon(lons, lats)
-    if hull_poly is None:
-        return None, tile_meters, None
 
+def _coverage_regions_from_uab_tiles(uab_df: pd.DataFrame, tile_meters: float, radius_m: float,
+                                     max_tiles: int = 40000) -> list[Polygon]:
+    """Approximate coverage regions using the same tiling logic as UAB tiles.
+    A tile is considered 'covered' if its minimum distance to any AP < radius_m.
+    Connected covered tiles are merged and their union polygon extracted.
+    Returns list of polygons (one per connected coverage area)."""
+    if uab_df.empty:
+        return []
+    lons = uab_df["lon"].to_numpy(float)
+    lats = uab_df["lat"].to_numpy(float)
+    hull = _compute_convex_hull_polygon(lons, lats)
+    if hull is None:
+        return []
+    # Grid resolution (reuse logic from _uab_tiled_choropleth_layer minimal subset)
     lat0 = float(np.mean(lats)) if len(lats) else 41.5
     meters_per_deg_lat = 111_320.0
     meters_per_deg_lon = 111_320.0 * np.cos(np.deg2rad(lat0))
     dlat = tile_meters / meters_per_deg_lat
     dlon = tile_meters / max(meters_per_deg_lon, 1e-6)
-
-    minx, miny, maxx, maxy = hull_poly.bounds
+    minx, miny, maxx, maxy = hull.bounds
     lon_centers = np.arange(minx + dlon/2, maxx, dlon)
     lat_centers = np.arange(miny + dlat/2, maxy, dlat)
     XX, YY = np.meshgrid(lon_centers, lat_centers)
     centers = np.column_stack([XX.ravel(), YY.ravel()])
-
-    # Mask inside hull
-    x_h, y_h = hull_poly.exterior.coords.xy
-    poly_path = MplPath(np.vstack([x_h, y_h]).T)
+    poly_path = MplPath(np.vstack(hull.exterior.coords.xy).T)
     inside = poly_path.contains_points(centers)
     centers_in = centers[inside]
-
-    effective_tile_meters = tile_meters
-    n_tiles = centers_in.shape[0]
-    if n_tiles > max_tiles and n_tiles > 0:
-        factor = float(np.ceil(n_tiles / max_tiles))
-        effective_tile_meters = tile_meters * factor
-        dlat *= factor
-        dlon *= factor
-        lon_centers = np.arange(minx + dlon/2, maxx, dlon)
-        lat_centers = np.arange(miny + dlat/2, maxy, dlat)
-        XX, YY = np.meshgrid(lon_centers, lat_centers)
-        centers = np.column_stack([XX.ravel(), YY.ravel()])
-        inside = poly_path.contains_points(centers)
-        centers_in = centers[inside]
-
     if centers_in.size == 0:
-        return None, effective_tile_meters, hull_poly
-
-    # Distàncies i assignació AWVD
-    dists = _haversine_m(centers_in[:, 1][:, None], centers_in[:, 0][:, None], lats[None, :], lons[None, :])
-    # Additively weighted distance: d - w * radius_m
-    awd = dists - (weights[None, :] * max(radius_m, 1e-6))
-    owners = np.argmin(awd, axis=1)  # (tiles,)
-    z_vals = weights[owners]
-
-    # Build GeoJSON per tile
-    features = []
-    ids = []
-    for i, (lon_c, lat_c) in enumerate(centers_in):
-        lon0, lon1 = lon_c - dlon/2, lon_c + dlon/2
-        lat0, lat1 = lat_c - dlat/2, lat_c + dlat/2
-        poly_coords = [[
-            [lon0, lat0], [lon1, lat0], [lon1, lat1], [lon0, lat1], [lon0, lat0]
-        ]]
-        features.append({
-            "type": "Feature",
-            "id": str(i),
-            "properties": {"owner": int(owners[i])},
-            "geometry": {"type": "Polygon", "coordinates": poly_coords}
-        })
-        ids.append(str(i))
-
-    geojson = {"type": "FeatureCollection", "features": features}
-
-    ch = go.Choroplethmapbox(
-        geojson=geojson,
-        locations=ids,
-        z=z_vals,
-        colorscale=colorscale,
-        zmin=0, zmax=1,
-        marker_opacity=0.25,
-        marker_line_width=1,
-        marker_line_color="#444",
-        showscale=True,
-        colorbar=dict(title=f"AWVD weight ({weight_col})", thickness=12, len=0.5),
-        name=name,
-    )
-
-    return ch, effective_tile_meters, hull_poly
+        return []
+    # Distàncies als APs
+    dists = _haversine_m(centers_in[:,1][:,None], centers_in[:,0][:,None], lats[None,:], lons[None,:])
+    d_min = dists.min(axis=1)
+    covered_mask = d_min < radius_m
+    covered_centers = centers_in[covered_mask]
+    if covered_centers.size == 0:
+        return []
+    # Construir polígons de cada tile cobert
+    tile_polys = []
+    for (cx, cy) in covered_centers:
+        lon0, lon1 = cx - dlon/2, cx + dlon/2
+        lat0, lat1 = cy - dlat/2, cy + dlat/2
+        tile_polys.append(Polygon([(lon0, lat0), (lon1, lat0), (lon1, lat1), (lon0, lat1)]))
+    # Unir i separar components
+    merged = unary_union(tile_polys)
+    polys = []
+    if merged.geom_type == 'Polygon':
+        polys = [merged]
+    elif merged.geom_type == 'MultiPolygon':
+        polys = list(merged.geoms)
+    # Opcionalment filtrar polígons massa petits
+    final_polys = [p for p in polys if p.area > 0]
+    return final_polys
 
 
 def _uab_tiled_choropleth_layer(df_uab: pd.DataFrame, *, tile_meters: float = 3.0,
@@ -719,21 +921,31 @@ with st.sidebar:
                               help="conflictivity: ponderació dels APs; connectivity: creix fins a 1 al radi indicat")
     radius_m = st.slider("Radi de connectivitat (m)", 5, 60, 25, step=5,
                          help="Distància màxima perquè la connectivitat arribi a 1 (o decaigui a 0 en mode conflictivitat).")
-
-    min_conf = st.slider("Minimum conflictivity (table only)", 0.0, 1.0, 0.0, 0.01)
+    band_mode = st.radio(
+        "Band Mode",
+        options=["worst", "avg", "2.4GHz", "5GHz"],
+        index=0,
+        help="worst: max(max_2.4, max_5) • avg: weighted average of band maxima",
+        horizontal=True,
+    )
     show_uab = st.checkbox("Mostrar UAB (no SAB)", value=True)
     show_sab = st.checkbox("Mostrar Sabadell (AP-SAB)", value=True)
-    tile_m = st.number_input("Mida del tile UAB (m)", min_value=1.0, max_value=100.0, value=3.0, step=1.0)
-    max_tiles = st.slider("Límit màxim de tiles", 5000, 80000, 40000, step=5000, help="Si se supera, es mostreja una submostra de tiles preservant la mida del tile.")
-    top_n = st.slider("Top N listing", 5, 50, 15, step=5)
+    # Mida de tile fixa (7 m) i sense límit de tiles
+    TILE_M_FIXED = 7.0
+    MAX_TILES_NO_LIMIT = 1_000_000_000
     st.divider()
     st.header("Voronoi ponderat")
-    show_awvd = st.checkbox("Mostrar diagrama AWVD", value=False, help="Additively weighted Voronoi (d - w*R).")
-    weight_source = st.selectbox("Pes dels APs", ["client_norm", "util_norm", "conflictivity"], index=0,
-                                 help="Columna usada com a pes normalitzat (0..1) en el diagrama AWVD.")
+    show_awvd = st.checkbox("Mostrar arestes Voronoi ponderat", value=False,
+                            help="Aproximació additivament ponderada (edges) – baixa connectivitat => pes alt.")
+    weight_source = st.selectbox(
+        "Base connectivitat (per invertir)",
+        ["conflictivity", "client_count", "max_radio_util", "airtime_score"],
+        index=0,
+        help="Es normalitza i s'inverteix: pes = 1 - norm(col)."
+    )
 
 # Load data for selected timestamp
-ap_df = read_ap_snapshot(selected_path)
+ap_df = read_ap_snapshot(selected_path, band_mode=band_mode)
 
 # Merge AP + geoloc; keep ALL data for interpolation consistency
 merged = ap_df.merge(geo_df, on="name", how="inner")
@@ -774,64 +986,114 @@ fig = create_dual_interpolated_map(
     show_uab=show_uab,
     show_sab=show_sab,
     zoom=15,
-    tile_meters=float(tile_m),
-    max_tiles=int(max_tiles),
+    tile_meters=TILE_M_FIXED,
+    max_tiles=MAX_TILES_NO_LIMIT,
     radius_m=radius_m,
     value_mode=value_mode,
 )
 
 # Afegir capa AWVD si es demana (sobre UAB només, excloent SAB per simplicitat)
 if show_awvd:
-    awvd_df = map_df[map_df["group_code"] != "SAB"].copy()
-    if not awvd_df.empty and weight_source in awvd_df.columns:
-        # Assegurar normalització 0..1 de la columna triada (si no ho està ja)
-        col = weight_source
-        vals = pd.to_numeric(awvd_df[col], errors="coerce").fillna(0.0)
-        mn, mx = float(vals.min()), float(vals.max())
-        if mx - mn > 1e-12:
-            awvd_df[col + "_norm_tmp"] = (vals - mn) / (mx - mn)
-            weight_col = col + "_norm_tmp"
-        else:
-            awvd_df[col + "_norm_tmp"] = 0.0
-            weight_col = col + "_norm_tmp"
-        awvd_trace, awvd_eff_tile, _ = _weighted_voronoi_tiled_layer(
-            awvd_df, tile_meters=float(tile_m), radius_m=radius_m,
-            weight_col=weight_col, max_tiles=int(max_tiles), name="AWVD"
+    aw_df = map_df[map_df["group_code"] != "SAB"].copy()
+    base_col = weight_source if weight_source in aw_df.columns else "conflictivity"
+    if not aw_df.empty and base_col in aw_df.columns:
+        # 1) Regions de cobertura (unió), amb fallback a hull complet
+        regions = _coverage_regions_from_uab_tiles(
+            aw_df,
+            tile_meters=float(TILE_M_FIXED),
+            radius_m=radius_m,
+            max_tiles=int(MAX_TILES_NO_LIMIT)
         )
-        if awvd_trace is not None:
-            fig.add_trace(awvd_trace)
-            fig.add_annotation(text=f"AWVD tile ≈ {awvd_eff_tile:.1f} m",
-                               showarrow=False, xref="paper", yref="paper",
-                               x=0.02, y=0.92, bgcolor="rgba(255,255,255,0.7)", bordercolor="#666", font=dict(size=10))
+        union_poly = None
+        if regions:
+            union_poly = unary_union(regions)
+        else:
+            union_poly = _compute_convex_hull_polygon(aw_df["lon"].to_numpy(float), aw_df["lat"].to_numpy(float))
+
+        # 2) Dedupe: agrupar APs solapats per (lon,lat) i prendre el pes "pitjor" (max)
+        dedup = aw_df[["lon","lat", base_col]].copy()
+        dedup = (dedup.groupby(["lon","lat"], as_index=False)
+                       .agg({base_col: "max"}))
+
+        # 3) Buffer lleu de la geometria per evitar talls numèrics
+        if union_poly is not None:
+            try:
+                lat0 = float(aw_df["lat"].mean()) if len(aw_df) else 41.5
+                meters_per_deg_lon = 111_320.0 * np.cos(np.deg2rad(lat0))
+                eps_deg = (max(0.5, TILE_M_FIXED * 0.15)) / max(meters_per_deg_lon, 1e-6)  # ~0.5–1m
+                union_poly = union_poly.buffer(eps_deg)
+            except Exception:
+                pass
+
+        # 4) Voronoi ponderat sobre TOTS els punts, tallat per la unió
+        total_edges = _inverted_weighted_voronoi_edges(
+            dedup.rename(columns={base_col: base_col}),
+            weight_col=base_col,
+            radius_m=radius_m,
+            clip_polygon=union_poly,
+            tolerance_m=max(5.0, radius_m * 0.25)
+        ) if union_poly is not None and len(dedup) >= 3 else []
+
+        if total_edges:
+            # Merge small segments into continuous polylines to avoid tiny gaps
+            line_geoms = [LineString([(x1, y1), (x2, y2)]) for (x1, y1, x2, y2) in total_edges]
+            merged_lines = linemerge(unary_union(line_geoms))
+            lons = []
+            lats = []
+            def add_lines(ls):
+                coords = list(ls.coords)
+                if len(coords) >= 2:
+                    for (x, y) in coords:
+                        lons.append(x)
+                        lats.append(y)
+                    lons.append(None)
+                    lats.append(None)
+            if merged_lines.geom_type == 'LineString':
+                add_lines(merged_lines)
+            elif merged_lines.geom_type == 'MultiLineString':
+                for ls in merged_lines.geoms:
+                    add_lines(ls)
+            fig.add_trace(go.Scattermapbox(
+                lon=lons,
+                lat=lats,
+                mode='lines',
+                line=dict(color='#0b3d91', width=2),
+                name='Voronoi (ponderat, invertit)',
+                hoverinfo='skip'
+            ))
+        # Dibuixar la/les regions de cobertura (unió) per referència
+        if union_poly is not None:
+            hull_lons = []
+            hull_lats = []
+            polys = [union_poly] if union_poly.geom_type == 'Polygon' else list(union_poly.geoms)
+            for reg in polys:
+                xh, yh = reg.exterior.coords.xy
+                hull_lons.extend(list(xh) + [None])
+                hull_lats.extend(list(yh) + [None])
+                for ring in reg.interiors:
+                    xi, yi = zip(*list(ring.coords))
+                    hull_lons.extend(list(xi) + [None])
+                    hull_lats.extend(list(yi) + [None])
+            if hull_lons:
+                fig.add_trace(go.Scattermapbox(
+                    lon=hull_lons,
+                    lat=hull_lats,
+                    mode='lines',
+                    line=dict(color='#0b3d91', width=1),
+                    name='Coverage hulls',
+                    hoverinfo='skip'
+                ))
+            # Anotació: nombre de polígons
+            n_regs = 1 if union_poly.geom_type == 'Polygon' else len(list(union_poly.geoms))
+            fig.add_annotation(text=f"Voronoi ponderat (edges) — {n_regs} regions", xref="paper", yref="paper", x=0.02, y=0.90,
+                               showarrow=False, bgcolor="rgba(0,0,0,0.4)", font=dict(color='white', size=10))
 
 st.plotly_chart(fig, use_container_width=True)
 
 
-# Top conflictive listing — filtered only for the table visualization
-st.subheader("Top conflictive Access Points")
-filtered_for_table = map_df[map_df["conflictivity"] >= min_conf].copy()
-if filtered_for_table.empty:
-    st.info(f"No APs with conflictivity >= {min_conf:.2f}")
-else:
-    cols = [c for c in ["name", "group_code", "client_count", "max_radio_util", "conflictivity"] if c in filtered_for_table.columns]
-    tmp = filtered_for_table[cols].copy()
-    if "group_code" not in tmp.columns:
-        tmp["group_code"] = tmp["name"].apply(extract_group)
-    top_df = tmp.sort_values("conflictivity", ascending=False).head(top_n)
-    top_df = top_df.rename(columns={"name": "Access Point", "group_code": "Building", "conflictivity": "Conflictivity Score"})
-    if "client_count" in top_df.columns:
-        top_df = top_df.rename(columns={"client_count": "Clients"})
-    if "max_radio_util" in top_df.columns:
-        top_df = top_df.rename(columns={"max_radio_util": "Max Radio Util %"})
-
-    if "Conflictivity Score" in top_df.columns:
-        top_df["Conflictivity Score"] = top_df["Conflictivity Score"].map(lambda x: f"{x:.3f}")
-
-    st.dataframe(top_df, use_container_width=True, hide_index=True)
-
-
 # Footer
 st.caption(
-    "💡 Conflictivity = 0.6 × normalized_clients + 0.4 × max_radio_utilization  |  "
-    "🎨 Color Scale: 🟢 Green (Low) → 🟡 Yellow (Medium) → 🔴 Red (High)"
+    "📻 Band mode aplicat (worst/avg/2.4/5) • "
+    "💡 Conflictivity ≈ 0.85×airtime + 0.10×clients + 0.02×CPU + 0.03×Memòria  |  "
+    "🎨 Escala: 🟢 Low → 🟡 Medium → 🔴 High (0–1)"
 )
