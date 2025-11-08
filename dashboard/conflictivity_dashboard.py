@@ -324,6 +324,10 @@ def create_optimized_heatmap(
 
     location_groups["max_conflictivity"] = location_groups["conflictivity"].apply(max)
     location_groups["ap_count"] = location_groups["name"].apply(len)
+    
+    # Filter out locations below minimum conflictivity
+    location_groups = location_groups[location_groups["max_conflictivity"] >= min_conflictivity]
+    
     location_groups = location_groups.sort_values("max_conflictivity", ascending=True)
 
     hover_texts = []
@@ -357,10 +361,6 @@ def create_optimized_heatmap(
                     t += "<br>"
         hover_texts.append(t)
 
-    opacity_values = location_groups["max_conflictivity"].apply(
-        lambda x: 0.85 if x >= min_conflictivity else 0.15
-    ).tolist()
-
     fig = go.Figure(
         go.Scattermapbox(
             lat=location_groups["lat"],
@@ -376,7 +376,7 @@ def create_optimized_heatmap(
                 ],
                 cmin=0,
                 cmax=1,
-                opacity=opacity_values,
+                opacity=0.85,
                 showscale=True,
                 colorbar=dict(
                     title="Conflictivity",
