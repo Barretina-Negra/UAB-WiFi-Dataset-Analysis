@@ -485,6 +485,98 @@ def _inverted_weighted_voronoi_edges(df: pd.DataFrame, *, weight_col: str = "con
     return edges
 
 
+def _most_conflictive_voronoi_vertex(df: pd.DataFrame, *, radius_m: float, coverage_poly: Polygon) -> Optional[tuple]:
+    """Troba el voronoi vertex amb major conflictivitat (ponderada) evitant dominància purament de frontera.
+    Retorna (lon, lat, score) o None.
+    """
+    if df.empty:
+        return None
+    try:
+        from scipy.spatial import Voronoi
+    except Exception:
+        return None
+    pts_lon = df["lon"].to_numpy(float)
+    pts_lat = df["lat"].to_numpy(float)
+    cvals = df["conflictivity"].to_numpy(float)
+    if len(pts_lon) < 3:
+        return None
+    pts = np.column_stack([pts_lon, pts_lat])
+    # jitter duplicates minimal
+    uniq, counts = np.unique(pts, axis=0, return_counts=True)
+    if np.any(counts > 1):
+        rng = np.random.RandomState(42)
+        pts = pts + rng.randn(*pts.shape) * 1e-8
+    vor = Voronoi(pts)
+    best = None
+    for v in vor.vertices:
+        lon, lat = float(v[0]), float(v[1])
+        p = Point(lon, lat)
+        if not coverage_poly.contains(p):
+            continue
+        # Distàncies als APs
+        dists = _haversine_m(lat, lon, pts_lat, pts_lon)  # (M,)
+        boundary_conf = np.where(dists.min() >= radius_m, 1.0, dists.min() / max(radius_m, 1e-6))
+        W = _interp_kernel(dists, radius_m, mode="decay")
+        denom = W.sum()
+        if denom <= 0:
+            continue
+        weighted_conf = (W * cvals).sum() / denom
+        combined = max(weighted_conf, boundary_conf)
+        # Evitar vertices dominats clarament per frontera (on boundary_conf > weighted_conf i boundary_conf ~1)
+        if boundary_conf >= 0.98 and weighted_conf < 0.5:
+            continue
+        if best is None or combined > best[2]:
+            best = (lon, lat, float(combined))
+    return best
+
+
+def _top_conflictive_voronoi_vertices(df: pd.DataFrame, *, radius_m: float, coverage_poly: Polygon, k: int = 3) -> list[tuple]:
+    """Retorna els top-k vertices Voronoi interiors amb score de conflictivitat més alt.
+    Cada element és (lon, lat, score).
+    """
+    if df.empty:
+        return []
+    try:
+        from scipy.spatial import Voronoi
+    except Exception:
+        return []
+    pts_lon = df["lon"].to_numpy(float)
+    pts_lat = df["lat"].to_numpy(float)
+    cvals = df["conflictivity"].to_numpy(float)
+    if len(pts_lon) < 3:
+        return []
+    pts = np.column_stack([pts_lon, pts_lat])
+    # jitter duplicates minimal
+    try:
+        uniq, counts = np.unique(pts, axis=0, return_counts=True)
+        if np.any(counts > 1):
+            rng = np.random.RandomState(7)
+            pts = pts + rng.randn(*pts.shape) * 1e-8
+    except Exception:
+        pass
+    vor = Voronoi(pts)
+    cand = []
+    for v in vor.vertices:
+        lon, lat = float(v[0]), float(v[1])
+        p = Point(lon, lat)
+        if not coverage_poly.contains(p):
+            continue
+        dists = _haversine_m(lat, lon, pts_lat, pts_lon)
+        dmin = dists.min()
+        boundary_conf = 1.0 if dmin >= radius_m else (dmin / max(radius_m, 1e-6))
+        W = _interp_kernel(dists, radius_m, mode="decay")
+        denom = W.sum()
+        if denom <= 0:
+            continue
+        weighted_conf = float((W * cvals).sum() / denom)
+        combined = max(weighted_conf, boundary_conf)
+        # descarta vertices dominats per frontera pura
+        if boundary_conf >= 0.98 and weighted_conf < 0.5:
+            continue
+        cand.append((lon, lat, combined))
+    cand.sort(key=lambda t: t[2], reverse=True)
+    return cand[:max(0, int(k or 0))]
+
 def _snap_and_connect_edges(segments: list[tuple[float,float,float,float]], clip_polygon: Polygon,
                             *, lat0: float, snap_m: float = 2.0, join_m: float = 4.0):
     """Post-process Voronoi segments to enforce connectivity.
@@ -1102,6 +1194,8 @@ with st.sidebar:
     VOR_TOL_M_FIXED = 24.0
     SNAP_M_DEFAULT = float(max(1.5, TILE_M_FIXED * 0.2))
     JOIN_M_DEFAULT = float(max(3.0, TILE_M_FIXED * 0.6))
+    show_hot_vertex = st.checkbox("Marcar punt més conflictiu (vertex Voronoi)", value=False,
+                                  help="Evalua vertices del Voronoi ponderat i marca el de major conflictivitat interior.")
 
 # Load data for selected timestamp
 ap_df = read_ap_snapshot(selected_path, band_mode=band_mode)
@@ -1152,6 +1246,7 @@ fig = create_dual_interpolated_map(
 )
 
 # Afegir capa AWVD si es demana (sobre UAB només, excloent SAB per simplicitat)
+hot_vertices_info = None
 if show_awvd:
     aw_df = map_df[map_df["group_code"] != "SAB"].copy()
     base_col = weight_source if weight_source in aw_df.columns else "conflictivity"
@@ -1226,6 +1321,63 @@ if show_awvd:
                 name='Voronoi (ponderat, invertit)',
                 hoverinfo='skip'
             ))
+            # Top vertices més conflictius
+            if show_hot_vertex and union_poly is not None:
+                topv = _top_conflictive_voronoi_vertices(aw_df, radius_m=radius_m, coverage_poly=union_poly, k=3)
+                if topv:
+                    # Guarda per a la taula
+                    hot_vertices_info = [
+                        {"rank": i+1, "lon": v[0], "lat": v[1], "score": float(v[2])}
+                        for i, v in enumerate(topv)
+                    ]
+                    # Marker #1 (vermell)
+                    hv_lon, hv_lat, hv_score = topv[0]
+                    # Halo blanc sota el símbol per simular contorn
+                    fig.add_trace(go.Scattermapbox(
+                        lon=[hv_lon], lat=[hv_lat], mode='markers',
+                        marker=dict(size=24, color='#ffffff', symbol='circle', opacity=0.95),
+                        hoverinfo='skip', showlegend=False
+                    ))
+                    fig.add_trace(go.Scattermapbox(
+                        lon=[hv_lon], lat=[hv_lat], mode='markers+text',
+                        marker=dict(
+                            size=18,
+                            color='#ff00ff',  # magenta neó
+                            symbol='star',
+                            opacity=0.95
+                        ),
+                        text=["#1"], textposition='top center',
+                        textfont=dict(color='#ffffff', size=12, family='Arial Black'),
+                        name='Hotspot #1',
+                        hovertemplate='<b>#1 Hotspot</b><br>Score=%{customdata:.3f}<extra></extra>',
+                        customdata=[hv_score]
+                    ))
+                    # Markers #2-#3 (taronja)
+                    if len(topv) > 1:
+                        lons = [t[0] for t in topv[1:]]
+                        lats = [t[1] for t in topv[1:]]
+                        scores = [float(t[2]) for t in topv[1:]]
+                        labels = [f"#{i+2}" for i in range(len(lons))]
+                        # Halos blancs per #2-#3
+                        fig.add_trace(go.Scattermapbox(
+                            lon=lons, lat=lats, mode='markers',
+                            marker=dict(size=20, color='#ffffff', symbol='circle', opacity=0.95),
+                            hoverinfo='skip', showlegend=False
+                        ))
+                        fig.add_trace(go.Scattermapbox(
+                            lon=lons, lat=lats, mode='markers+text',
+                            marker=dict(
+                                size=16,
+                                color='#00ffff',  # cian neó
+                                symbol='star',
+                                opacity=0.95
+                            ),
+                            text=labels, textposition='top center',
+                            textfont=dict(color='#ffffff', size=11, family='Arial Black'),
+                            name='Hotspot #2-#3',
+                            hovertemplate='<b>%{text}</b><br>Score=%{customdata:.3f}<extra></extra>',
+                            customdata=scores
+                        ))
         # Dibuixar la/les regions de cobertura (unió) per referència
         if union_poly is not None:
             hull_lons = []
@@ -1254,6 +1406,16 @@ if show_awvd:
                                showarrow=False, bgcolor="rgba(0,0,0,0.4)", font=dict(color='white', size=10))
 
 st.plotly_chart(fig, use_container_width=True)
+
+# Taula amb els top vertices si està activat
+try:
+    if show_awvd and show_hot_vertex and hot_vertices_info:
+        st.subheader("Top vertices Voronoi més conflictius")
+        top_df = pd.DataFrame(hot_vertices_info)
+        top_df["score"] = top_df["score"].map(lambda x: f"{x:.3f}")
+        st.dataframe(top_df, use_container_width=True, hide_index=True)
+except Exception:
+    pass
 
 
 # Footer
