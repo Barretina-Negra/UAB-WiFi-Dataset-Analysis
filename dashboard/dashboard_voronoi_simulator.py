@@ -1227,6 +1227,12 @@ with st.sidebar:
     )
     show_uab = st.checkbox("Mostrar UAB (no SAB)", value=True)
     show_sab = st.checkbox("Mostrar Sabadell (AP-SAB)", value=True)
+    # Quick control to reset any simulated map override
+    if st.session_state.get('map_override_df') is not None or st.session_state.get('new_node_markers'):
+        if st.button("Reset simulated map", help="Clear simulated results and return to baseline map"):
+            st.session_state.pop('map_override_df', None)
+            st.session_state.pop('new_node_markers', None)
+            st.rerun()
     
     TILE_M_FIXED = 7.0
     MAX_TILES_NO_LIMIT = 1_000_000_000
@@ -1440,9 +1446,8 @@ center_lat = float(map_df["lat"].mean())
 center_lon = float(map_df["lon"].mean())
 
 # Create dual interpolated map (use override if present)
-map_for_plot = st.session_state.get('map_override_df', map_df)
 fig = create_dual_interpolated_map(
-    df=map_for_plot,
+    df=map_df,
     center_lat=center_lat,
     center_lon=center_lon,
     show_uab=show_uab,
@@ -1452,19 +1457,6 @@ fig = create_dual_interpolated_map(
     max_tiles=MAX_TILES_NO_LIMIT,
     radius_m=radius_m,
 )
-
-# Overlay new simulated nodes (sky blue) if any
-if 'new_node_markers' in st.session_state and st.session_state['new_node_markers']:
-    nn = st.session_state['new_node_markers']
-    fig.add_trace(go.Scattermapbox(
-        lat=[p['lat'] for p in nn],
-        lon=[p['lon'] for p in nn],
-        mode='markers+text',
-        marker=dict(size=10, color='skyblue', opacity=0.95),
-        text=[p.get('label', 'AP-NEW') for p in nn],
-        textposition='top center',
-        name='New APs (simulated)',
-    ))
 
 # Overlay Voronoi candidate markers if discovered
 if 'voronoi_candidates' in st.session_state and not st.session_state.voronoi_candidates.empty:
@@ -1483,6 +1475,33 @@ if 'voronoi_candidates' in st.session_state and not st.session_state.voronoi_can
 
     # Show the map above the candidates table
     st.plotly_chart(fig, use_container_width=True)
+    # Render a second map with the simulated surface, if available
+    if 'map_override_df' in st.session_state and st.session_state['map_override_df'] is not None:
+        sim_df = st.session_state['map_override_df']
+        fig_sim = create_dual_interpolated_map(
+            df=sim_df,
+            center_lat=center_lat,
+            center_lon=center_lon,
+            show_uab=show_uab,
+            show_sab=show_sab,
+            zoom=15,
+            tile_meters=TILE_M_FIXED,
+            max_tiles=MAX_TILES_NO_LIMIT,
+            radius_m=radius_m,
+        )
+        if 'new_node_markers' in st.session_state and st.session_state['new_node_markers']:
+            nn = st.session_state['new_node_markers']
+            fig_sim.add_trace(go.Scattermapbox(
+                lat=[p['lat'] for p in nn],
+                lon=[p['lon'] for p in nn],
+                mode='markers+text',
+                marker=dict(size=10, color='skyblue', opacity=0.95),
+                text=[p.get('label', 'AP-NEW') for p in nn],
+                textposition='top center',
+                name='New APs (simulated)',
+            ))
+        st.subheader("Simulated Map")
+        st.plotly_chart(fig_sim, use_container_width=True)
     map_rendered = True
 
     # Display candidate table with a central preview area above it
@@ -1720,7 +1739,9 @@ if 'voronoi_candidates' in st.session_state and not st.session_state.voronoi_can
                             df_after_multi = simulate_multiple_ap_additions(base_latest, combined_points, cfg_multi)
                             st.session_state['map_override_df'] = df_after_multi
                             st.session_state['new_node_markers'] = combined_points
-                            st.info("Map updated with combined simulated APs (sky blue markers). Scroll up to view.")
+                            st.success("Simulated Map rendered below with sky blue NEW AP markers.")
+                            # Trigger a second rerun so the top section can render the Simulated Map
+                            st.rerun()
                     except Exception as e:
                         st.warning(f"Combined map update failed: {e}")
     with col_results:
@@ -2080,6 +2101,33 @@ if run_simulation and st.session_state.get('run_sim', False):
 
 if 'map_rendered' not in locals():
     st.plotly_chart(fig, use_container_width=True)
+    # Render a second map with the simulated surface, if available
+    if 'map_override_df' in st.session_state and st.session_state['map_override_df'] is not None:
+        sim_df = st.session_state['map_override_df']
+        fig_sim = create_dual_interpolated_map(
+            df=sim_df,
+            center_lat=center_lat,
+            center_lon=center_lon,
+            show_uab=show_uab,
+            show_sab=show_sab,
+            zoom=15,
+            tile_meters=TILE_M_FIXED,
+            max_tiles=MAX_TILES_NO_LIMIT,
+            radius_m=radius_m,
+        )
+        if 'new_node_markers' in st.session_state and st.session_state['new_node_markers']:
+            nn = st.session_state['new_node_markers']
+            fig_sim.add_trace(go.Scattermapbox(
+                lat=[p['lat'] for p in nn],
+                lon=[p['lon'] for p in nn],
+                mode='markers+text',
+                marker=dict(size=10, color='skyblue', opacity=0.95),
+                text=[p.get('label', 'AP-NEW') for p in nn],
+                textposition='top center',
+                name='New APs (simulated)',
+            ))
+        st.subheader("Simulated Map")
+        st.plotly_chart(fig_sim, use_container_width=True)
 
 # Footer
 st.caption(
