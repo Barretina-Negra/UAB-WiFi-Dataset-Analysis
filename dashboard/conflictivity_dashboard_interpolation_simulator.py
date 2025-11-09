@@ -998,21 +998,55 @@ if run_simulation and st.session_state.get('run_sim', False):
                 results_df = pd.DataFrame(results)
                 results_df = results_df.sort_values('composite_score', ascending=False)
                 
-                # Add to map
+                # Add blue dot for the best candidate (rank #1)
+                if len(results_df) > 0:
+                    best = results_df.iloc[0]
+                    fig.add_trace(go.Scattermapbox(
+                        lat=[best['lat']],
+                        lon=[best['lon']],
+                        mode='markers',
+                        marker=dict(
+                            size=25,
+                            color='blue',
+                            opacity=0.8
+                        ),
+                        name='🎯 Best Location',
+                        hovertemplate=(
+                            '<b>🎯 Best Placement Location</b><br>'
+                            'Score: %{customdata[0]:.3f}<br>'
+                            'Avg Reduction: %{customdata[1]:.3f} (%{customdata[2]:.1f}%)<br>'
+                            'Worst AP Improvement: %{customdata[3]:.3f}<br>'
+                            'New AP Clients: %{customdata[4]:.0f}<br>'
+                            '<extra></extra>'
+                        ),
+                        customdata=np.column_stack([
+                            [best['composite_score']],
+                            [best['avg_reduction']],
+                            [best['avg_reduction_pct']],
+                            [best['worst_ap_improvement']],
+                            [best['new_ap_client_count']],
+                        ]),
+                    ))
+                
+                # Add numbered markers for all candidates
                 for idx, row in results_df.iterrows():
                     rank = idx + 1
+                    # Use different colors: blue for #1, cyan for others
+                    marker_color = 'yellow' if rank == 1 else 'cyan'
+                    marker_size = 20 if rank == 1 else 16
+                    
                     fig.add_trace(go.Scattermapbox(
                         lat=[row['lat']],
                         lon=[row['lon']],
                         mode='markers+text',
                         marker=dict(
-                            size=20,
-                            color='cyan',
+                            size=marker_size,
+                            color=marker_color,
                             symbol='star'
                         ),
                         text=f"#{rank}",
                         textposition="top center",
-                        textfont=dict(size=14, color='white', family='Arial Black'),
+                        textfont=dict(size=14, color='darkblue' if rank == 1 else 'white', family='Arial Black'),
                         name=f'Proposed AP #{rank}',
                         hovertemplate=(
                             f'<b>Proposed AP #{rank}</b><br>'
