@@ -979,7 +979,7 @@ def on_dialog_close():
     st.session_state.chart_refresh_key += 1
 
 # Dialog function for AINA AI analysis (used in AI Heatmap mode)
-@st.dialog("🤖 Anàlisi AINA AI", width="large")
+@st.dialog("🤖 Anàlisi AINA AI", width="large", on_dismiss=on_dialog_close)
 def show_aina_analysis(ap_name: str, ap_row: pd.Series):
     """Show AINA AI analysis in a modal dialog."""
     st.subheader(f"Access Point: {ap_name}")
