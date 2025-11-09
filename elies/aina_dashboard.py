@@ -597,7 +597,7 @@ Entrades per AP
 
 - cpu_utilization (%)
 
-- mem_used_pct = 100 × (1 − mem_free/mem_total)
+- mem_used_pct = 100 x (1 - mem_free/mem_total)
 
 1) Malestar d'aire (airtime) per banda
 
@@ -605,23 +605,23 @@ Entrades per AP
 
 2,4 GHz (band="2g")
 
-- 0–10% → 0–0,05
+- 0-10% → 0-0,05
 
-- 10–25% → 0,05–0,40
+- 10-25% → 0,05-0,40
 
-- 25–50% → 0,40–0,75
+- 25-50% → 0,40-0,75
 
-- 50–100% → 0,75–1,00
+- 50-100% → 0,75-1,00
 
 5 GHz (band="5g")
 
-- 0–15% → 0–0,05
+- 0-15% → 0-0,05
 
-- 15–35% → 0,05–0,40
+- 15-35% → 0,05-0,40
 
-- 35–65% → 0,40–0,75
+- 35-65% → 0,40-0,75
 
-- 65–100% → 0,75–1,00
+- 65-100% → 0,75-1,00
 
 2) Agregació de l'airtime entre bandes
 
@@ -635,7 +635,7 @@ Entrades per AP
 
 - Si client_count == 0, reduir airtime_score un 20% per distingir soroll veí de contenció:
 
-  airtime_score_adj = airtime_score × 0,8
+  airtime_score_adj = airtime_score x 0,8
 
 - Altrament airtime_score_adj = airtime_score
 
@@ -655,17 +655,17 @@ Entrades per AP
 
   - ≤70% → 0
 
-  - 70–90% → lineal fins a 0,6
+  - 70-90% → lineal fins a 0,6
 
-  - 90–100% → lineal fins a 1,0
+  - 90-100% → lineal fins a 1,0
 
 - Memòria (percentatge usat):
 
   - ≤80% → 0
 
-  - 80–95% → lineal fins a 0,6
+  - 80-95% → lineal fins a 0,6
 
-  - 95–100% → lineal fins a 1,0
+  - 95-100% → lineal fins a 1,0
 
 6) Combinació en conflictivitat
 
@@ -675,13 +675,13 @@ Entrades per AP
 
   conflictivity =
 
-    0,75 × airtime_score_filled +
+    0,75 x airtime_score_filled +
 
-    0,15 × client_score +
+    0,15 x client_score +
 
-    0,05 × cpu_score +
+    0,05 x cpu_score +
 
-    0,05 × mem_score
+    0,05 x mem_score
 
 Intuïció
 
@@ -695,13 +695,13 @@ Intuïció
 
 - Si un canal està ocupat però no tens clients, encara importa, però una mica menys.
 
-Ara vull que em raonis si l'AP es conflictiu per
+Ara vull que em raonis si l'AP es conflictiu per saturació d'ampla de banda ocupat (a partir de la `radio[].utilization`), per AP saturat (amb massa clients) o per ambdós.
 
-1. Ampla de banda ocupat
+L'AP està dissenyat per gestionar un màxim de 50 clients concurrents. Està massa carregat si s'apropa a supera aquest nombre.
 
-2. AP saturat (amb massa càrrega)
+La utilització de banda comença a afectar a partir de 40% de utilització.
 
-3. Ambdos
+Si n'hi ha un numero alt d'ambos, doncs clarament el raonament es ambdos. Pero 20-30 clients un AP pot gestionar facilment.
 """
     
     # Show loading state and call AINA AI
