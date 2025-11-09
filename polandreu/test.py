@@ -1,7 +1,14 @@
 import requests
+from dotenv import load_dotenv
+import os
+
+# Load environment variables
+load_dotenv()
 
 # La teva API key (obtinguda de PublicAI)
-API_KEY = "zpka_4d26fbf3602644d1a719050b1f901e2f_0030d1b5"
+API_KEY = os.getenv("AINA_API_KEY")
+if not API_KEY:
+    raise ValueError("AINA_API_KEY no trobada a les variables d'entorn. Si us plau, crea un fitxer .env amb AINA_API_KEY=tu_api_key")
 
 # Configuració
 headers = {
