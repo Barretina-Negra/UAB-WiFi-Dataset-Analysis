@@ -510,106 +510,52 @@ fig = create_optimized_heatmap(
 # Initialize session state for selected AP
 if "selected_ap" not in st.session_state:
     st.session_state.selected_ap = None
-if "aina_response" not in st.session_state:
-    st.session_state.aina_response = None
+if "last_opened_ap" not in st.session_state:
+    st.session_state.last_opened_ap = None
+if "dialog_just_dismissed" not in st.session_state:
+    st.session_state.dialog_just_dismissed = False
 
-# Handle map selection - make points selectable
-fig.update_layout(clickmode='event+select')
-selected_points = st.plotly_chart(fig, use_container_width=True, on_select="rerun", key="ap_map")
+# Function to clear selection when dialog is dismissed
+def clear_selection():
+    st.session_state.selected_ap = None
+    st.session_state.last_opened_ap = None
+    st.session_state.dialog_just_dismissed = True
 
-# Process selection
-if selected_points and "selection" in selected_points:
-    selection = selected_points["selection"]
-    if "points" in selection and len(selection["points"]) > 0:
-        # Get the first selected point
-        point = selection["points"][0]
-        ap_name = None
-        
-        # Try to get AP name from customdata first
-        if "customdata" in point and point["customdata"]:
-            ap_names = point["customdata"]
-            if isinstance(ap_names, list) and len(ap_names) > 0:
-                # customdata is always a list: [ap_name] for single AP or [ap1, ap2, ...] for multiple
-                ap_name = ap_names[0] if isinstance(ap_names[0], str) else str(ap_names[0])
-        
-        # Fallback: try to extract from text/hover if customdata didn't work
-        if not ap_name and "text" in point:
-            text = point["text"]
-            name_match = re.search(r"<b>([^<]+)</b>", text)
-            if name_match:
-                ap_name = name_match.group(1)
-        
-        if ap_name:
-            st.session_state.selected_ap = ap_name
-            st.session_state.aina_response = None  # Reset response when new AP selected
-
-# Top list
-st.subheader("Top conflictive Access Points")
-filtered_for_table = map_df[map_df["conflictivity"] >= min_conf].copy()
-if filtered_for_table.empty:
-    st.info(f"No APs with conflictivity >= {min_conf:.2f}")
-else:
-    cols = ["name", "group_code", "client_count", "max_radio_util", "conflictivity"]
-    cols = [c for c in cols if c in filtered_for_table.columns]
-    top_df = (
-        filtered_for_table[cols]
-        .sort_values("conflictivity", ascending=False)
-        .head(top_n)
-        .rename(
-            columns={
-                "name": "Access Point",
-                "group_code": "Building",
-                "conflictivity": "Conflictivity Score",
-                "client_count": "Clients",
-                "max_radio_util": "Radio Util % (agg)",
-            }
-        )
-    )
-    top_df["Conflictivity Score"] = top_df["Conflictivity Score"].map(lambda x: f"{x:.3f}")
-    st.dataframe(top_df, use_container_width=True, hide_index=True)
-
-band_info = {
-    "worst": "Worst band (max of 2.4/5 GHz)",
-    "avg": "Weighted average of band maxima (2.4:60%, 5:40%)",
-    "2.4GHz": "2.4 GHz only",
-    "5GHz": "5 GHz only",
-}
-st.caption(
-    f"📻 Band mode: {band_info[band_mode]}  |  "
-    "💡 Conflictivity measures Wi-Fi stress by combining channel congestion (75%), number of connected devices (15%), and AP resource usage (10%)  |  "
-    "🟢 Low ↔ 🔴 High (0–1)  |  "
-    "👆 Selecciona un AP al mapa per analitzar-lo amb AINA AI"
-)
-
-# AINA AI Analysis Section
-st.divider()
-
-if st.session_state.selected_ap:
-    ap_name = st.session_state.selected_ap
-    ap_data = merged[merged["name"] == ap_name]
+# Dialog function for AINA AI analysis
+@st.dialog("🤖 Anàlisi AINA AI", on_dismiss=clear_selection)
+def show_aina_analysis(ap_name: str, ap_row: pd.Series):
+    """Show AINA AI analysis in a modal dialog."""
+    st.subheader(f"Access Point: {ap_name}")
     
-    if not ap_data.empty:
-        ap_row = ap_data.iloc[0]
-        
-        st.subheader(f"🤖 Anàlisi AINA AI: {ap_name}")
-        
-        # Prepare AP data for AI
-        util_2g = ap_row.get("util_2g", np.nan)
-        util_5g = ap_row.get("util_5g", np.nan)
-        client_count = ap_row.get("client_count", 0)
-        cpu_util = ap_row.get("cpu_utilization", np.nan)
-        mem_free = ap_row.get("mem_free", np.nan)
-        mem_total = ap_row.get("mem_total", np.nan)
-        mem_used_pct = ap_row.get("mem_used_pct", np.nan)
-        conflictivity = ap_row.get("conflictivity", np.nan)
-        
-        # Format AP data for AI (handle NaN values)
-        def format_value(val, format_str="{:.1f}", default="no disponible"):
-            if val is None or (isinstance(val, float) and np.isnan(val)):
-                return default
-            return format_str.format(val)
-        
-        ap_info_text = f"""Dades de l'Access Point:
+    # Prepare AP data for AI
+    util_2g = ap_row.get("util_2g", np.nan)
+    util_5g = ap_row.get("util_5g", np.nan)
+    client_count = ap_row.get("client_count", 0)
+    cpu_util = ap_row.get("cpu_utilization", np.nan)
+    mem_free = ap_row.get("mem_free", np.nan)
+    mem_total = ap_row.get("mem_total", np.nan)
+    mem_used_pct = ap_row.get("mem_used_pct", np.nan)
+    conflictivity = ap_row.get("conflictivity", np.nan)
+    
+    # Format AP data for AI (handle NaN values)
+    def format_value(val, format_str="{:.1f}", default="no disponible"):
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            return default
+        return format_str.format(val)
+    
+    # Show AP info
+    with st.expander("📊 Dades de l'Access Point", expanded=False):
+        st.write(f"- **Nom:** {ap_name}")
+        st.write(f"- **Utilització màxima 2.4 GHz:** {format_value(util_2g, '{:.1f}%', 'no disponible')}")
+        st.write(f"- **Utilització màxima 5 GHz:** {format_value(util_5g, '{:.1f}%', 'no disponible')}")
+        st.write(f"- **Nombre de clients connectats:** {int(client_count) if not (isinstance(client_count, float) and np.isnan(client_count)) else 0}")
+        st.write(f"- **Utilització CPU:** {format_value(cpu_util, '{:.1f}%', 'no disponible')}")
+        st.write(f"- **Memòria lliure:** {format_value(mem_free, '{:.0f} MB', 'no disponible')}")
+        st.write(f"- **Memòria total:** {format_value(mem_total, '{:.0f} MB', 'no disponible')}")
+        st.write(f"- **Percentatge de memòria usada:** {format_value(mem_used_pct, '{:.1f}%', 'no disponible')}")
+        st.write(f"- **Puntuació de conflictivitat calculada:** {format_value(conflictivity, '{:.3f}', 'no disponible')}")
+    
+    ap_info_text = f"""Dades de l'Access Point:
 
 - Nom: {ap_name}
 - Utilització màxima 2.4 GHz: {format_value(util_2g, '{:.1f}%', 'no disponible')}
@@ -622,20 +568,20 @@ if st.session_state.selected_ap:
 - Puntuació de conflictivitat calculada: {format_value(conflictivity, '{:.3f}', 'no disponible')}
 
 """
-        
-        # AINA AI API call
-        API_KEY = os.getenv("AINA_API_KEY")
-        if not API_KEY:
-            st.error("❌ AINA_API_KEY no trobada a les variables d'entorn. Si us plau, crea un fitxer .env amb AINA_API_KEY=tu_api_key")
-            st.stop()
-        
-        headers = {
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json",
-            "User-Agent": "UAB-THE-HACK/1.0"
-        }
-        
-        prompt = ap_info_text + """Aquest Access Point es conflictiu, investiga les causes tenint en compte que aquests son els criteris que s'utilitza per calcular conflictivitat:
+    
+    # AINA AI API call
+    API_KEY = os.getenv("AINA_API_KEY")
+    if not API_KEY:
+        st.error("❌ AINA_API_KEY no trobada a les variables d'entorn. Si us plau, crea un fitxer .env amb AINA_API_KEY=tu_api_key")
+        return
+    
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+        "User-Agent": "UAB-THE-HACK/1.0"
+    }
+    
+    prompt = ap_info_text + """Aquest Access Point es conflictiu, investiga les causes tenint en compte que aquests son els criteris que s'utilitza per calcular conflictivitat:
 
 Aquí tens el nou model de conflictivitat, pas a pas.
 
@@ -753,41 +699,109 @@ Ara vull que em raonis si l'AP es conflictiu per
 
 3. Ambdos
 """
+    
+    # Show loading state and call AINA AI
+    with st.spinner("🔄 Esperant resposta d'AINA..."):
+        payload = {
+            "model": "BSC-LT/ALIA-40b-instruct_Q8_0",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1000,
+            "temperature": 0.7,
+        }
         
-        # Call AINA AI if not already called
-        if st.session_state.aina_response is None:
-            with st.spinner("🔄 Esperant resposta d'AINA..."):
-                payload = {
-                    "model": "BSC-LT/ALIA-40b-instruct_Q8_0",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 1000,
-                    "temperature": 0.7,
-                }
-                
-                try:
-                    response = requests.post(
-                        "https://api.publicai.co/v1/chat/completions",
-                        headers=headers,
-                        json=payload,
-                        timeout=30
-                    )
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        resposta = data["choices"][0]["message"]["content"]
-                        st.session_state.aina_response = resposta
-                    else:
-                        st.session_state.aina_response = f"❌ Error {response.status_code}: {response.text}"
-                except Exception as e:
-                    st.session_state.aina_response = f"❌ Error en la petició: {str(e)}"
+        try:
+            response = requests.post(
+                "https://api.publicai.co/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                resposta = data["choices"][0]["message"]["content"]
+                st.success("**Resposta d'AINA:**")
+                st.markdown(resposta)
+            else:
+                st.error(f"❌ Error {response.status_code}: {response.text}")
+        except Exception as e:
+            st.error(f"❌ Error en la petició: {str(e)}")
+
+# Handle map selection - make points selectable
+fig.update_layout(clickmode='event+select')
+selected_points = st.plotly_chart(fig, use_container_width=True, on_select="rerun", key="ap_map")
+
+# Process selection and open dialog
+if selected_points and "selection" in selected_points:
+    selection = selected_points["selection"]
+    if "points" in selection and len(selection["points"]) > 0:
+        # Get the first selected point
+        point = selection["points"][0]
+        ap_name = None
         
-        # Display response
-        if st.session_state.aina_response:
-            st.success("**Resposta d'AINA:**")
-            st.markdown(st.session_state.aina_response)
+        # Try to get AP name from customdata first
+        if "customdata" in point and point["customdata"]:
+            ap_names = point["customdata"]
+            if isinstance(ap_names, list) and len(ap_names) > 0:
+                # customdata is always a list: [ap_name] for single AP or [ap1, ap2, ...] for multiple
+                ap_name = ap_names[0] if isinstance(ap_names[0], str) else str(ap_names[0])
         
-        # Button to clear selection
-        if st.button("🗑️ Netejar selecció"):
-            st.session_state.selected_ap = None
-            st.session_state.aina_response = None
-            st.rerun()
+        # Fallback: try to extract from text/hover if customdata didn't work
+        if not ap_name and "text" in point:
+            text = point["text"]
+            name_match = re.search(r"<b>([^<]+)</b>", text)
+            if name_match:
+                ap_name = name_match.group(1)
+        
+        if ap_name:
+            # Only open dialog if this is a new selection (different from last opened)
+            # and we haven't just dismissed a dialog (to prevent reopening on same selection)
+            if ap_name != st.session_state.last_opened_ap and not st.session_state.dialog_just_dismissed:
+                st.session_state.selected_ap = ap_name
+                st.session_state.last_opened_ap = ap_name
+                st.session_state.dialog_just_dismissed = False
+                # Find AP data and open dialog
+                ap_data = merged[merged["name"] == ap_name]
+                if not ap_data.empty:
+                    show_aina_analysis(ap_name, ap_data.iloc[0])
+            elif st.session_state.dialog_just_dismissed:
+                # Reset the flag after processing
+                st.session_state.dialog_just_dismissed = False
+
+# Top list
+st.subheader("Top conflictive Access Points")
+filtered_for_table = map_df[map_df["conflictivity"] >= min_conf].copy()
+if filtered_for_table.empty:
+    st.info(f"No APs with conflictivity >= {min_conf:.2f}")
+else:
+    cols = ["name", "group_code", "client_count", "max_radio_util", "conflictivity"]
+    cols = [c for c in cols if c in filtered_for_table.columns]
+    top_df = (
+        filtered_for_table[cols]
+        .sort_values("conflictivity", ascending=False)
+        .head(top_n)
+        .rename(
+            columns={
+                "name": "Access Point",
+                "group_code": "Building",
+                "conflictivity": "Conflictivity Score",
+                "client_count": "Clients",
+                "max_radio_util": "Radio Util % (agg)",
+            }
+        )
+    )
+    top_df["Conflictivity Score"] = top_df["Conflictivity Score"].map(lambda x: f"{x:.3f}")
+    st.dataframe(top_df, use_container_width=True, hide_index=True)
+
+band_info = {
+    "worst": "Worst band (max of 2.4/5 GHz)",
+    "avg": "Weighted average of band maxima (2.4:60%, 5:40%)",
+    "2.4GHz": "2.4 GHz only",
+    "5GHz": "5 GHz only",
+}
+st.caption(
+    f"📻 Band mode: {band_info[band_mode]}  |  "
+    "💡 Conflictivity measures Wi-Fi stress by combining channel congestion (75%), number of connected devices (15%), and AP resource usage (10%)  |  "
+    "🟢 Low ↔ 🔴 High (0–1)  |  "
+    "👆 Selecciona un AP al mapa per analitzar-lo amb AINA AI"
+)
