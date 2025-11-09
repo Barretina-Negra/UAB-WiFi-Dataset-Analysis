@@ -507,26 +507,17 @@ fig = create_optimized_heatmap(
     zoom=15,
 )
 
-# Initialize session state for selected AP
-if "selected_ap" not in st.session_state:
-    st.session_state.selected_ap = None
-if "last_opened_ap" not in st.session_state:
-    st.session_state.last_opened_ap = None
-if "dialog_just_dismissed" not in st.session_state:
-    st.session_state.dialog_just_dismissed = False
-if "chart_key" not in st.session_state:
-    st.session_state.chart_key = 0
+# Initialize session state for chart key (to force refresh and clear selection)
+if "chart_refresh_key" not in st.session_state:
+    st.session_state.chart_refresh_key = 0
 
-# Function to clear selection when dialog is dismissed
-def clear_selection():
-    st.session_state.selected_ap = None
-    st.session_state.last_opened_ap = None
-    st.session_state.dialog_just_dismissed = True
-    # Increment chart key to force recreation and clear selection
-    st.session_state.chart_key += 1
+# Function to refresh chart when dialog closes
+def on_dialog_close():
+    # Increment key to force chart recreation and clear selection
+    st.session_state.chart_refresh_key += 1
 
 # Dialog function for AINA AI analysis
-@st.dialog("🤖 Anàlisi AINA AI", on_dismiss=clear_selection)
+@st.dialog("🤖 Anàlisi AINA AI", on_dismiss=on_dialog_close)
 def show_aina_analysis(ap_name: str, ap_row: pd.Series):
     """Show AINA AI analysis in a modal dialog."""
     st.subheader(f"Access Point: {ap_name}")
@@ -733,8 +724,13 @@ Si n'hi ha un numero alt d'ambos, doncs clarament el raonament es ambdos. Pero 2
 
 # Handle map selection - make points selectable
 fig.update_layout(clickmode='event+select')
-# Use chart_key to force recreation when dialog is dismissed (clears selection)
-selected_points = st.plotly_chart(fig, use_container_width=True, on_select="rerun", key=f"ap_map_{st.session_state.chart_key}")
+# Use chart_refresh_key to force recreation when dialog closes (clears selection)
+selected_points = st.plotly_chart(
+    fig, 
+    use_container_width=True, 
+    on_select="rerun",
+    key=f"ap_map_{st.session_state.chart_refresh_key}"
+)
 
 # Process selection and open dialog
 if selected_points and "selection" in selected_points:
@@ -759,19 +755,10 @@ if selected_points and "selection" in selected_points:
                 ap_name = name_match.group(1)
         
         if ap_name:
-            # Only open dialog if this is a new selection (different from last opened)
-            # and we haven't just dismissed a dialog (to prevent reopening on same selection)
-            if ap_name != st.session_state.last_opened_ap and not st.session_state.dialog_just_dismissed:
-                st.session_state.selected_ap = ap_name
-                st.session_state.last_opened_ap = ap_name
-                st.session_state.dialog_just_dismissed = False
-                # Find AP data and open dialog
-                ap_data = merged[merged["name"] == ap_name]
-                if not ap_data.empty:
-                    show_aina_analysis(ap_name, ap_data.iloc[0])
-            elif st.session_state.dialog_just_dismissed:
-                # Reset the flag after processing
-                st.session_state.dialog_just_dismissed = False
+            # Find AP data and open dialog
+            ap_data = merged[merged["name"] == ap_name]
+            if not ap_data.empty:
+                show_aina_analysis(ap_name, ap_data.iloc[0])
 
 # Top list
 st.subheader("Top conflictive Access Points")
