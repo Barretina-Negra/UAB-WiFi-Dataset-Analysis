@@ -1,18 +1,17 @@
 """
-Integrated Conflictivity Dashboard with AI Analysis and Interpolation
+Integrated Conflictivity Dashboard - AI Heatmap + Voronoi Analysis
 
 Purpose
-- Combine heatmap visualization with clickable AINA AI analysis
-- Show interpolated conflictivity surfaces for UAB campus
-- Dual-mode visualization: heatmap points + interpolated tiles
+- Unified dashboard combining two visualization modes:
+  1. AI Heatmap: Clickable AP points with AINA AI analysis
+  2. Voronoi: Interpolated surfaces with weighted Voronoi connectivity analysis
 - Time series navigation through Wi-Fi snapshots
 
 Features
-- Click any AP on the map to get AINA AI analysis
-- Interpolated tile-based visualization for smooth coverage view
-- Voronoi-weighted connectivity analysis
-- Band mode selection (2.4GHz, 5GHz, worst, avg)
-- Group filtering and time navigation
+- Radio button to switch between AI Heatmap and Voronoi modes
+- AI Heatmap: Click any AP to get AINA AI analysis of conflictivity
+- Voronoi: Advanced interpolation with connectivity regions and hotspot detection
+- Band mode selection, group filtering, time navigation
 
 Run
   streamlit run elies/integrated_dashboard.py
@@ -26,6 +25,7 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -264,7 +264,122 @@ def read_geoloc_points(geojson_path: Path) -> pd.DataFrame:
         rows.append({"name": name, "lon": lon, "lat": lat})
     return pd.DataFrame(rows)
 
-# -------- Interpolation utilities --------
+# ======== AI HEATMAP MODE FUNCTIONS (from aina_dashboard.py) ========
+
+def create_optimized_heatmap(
+    df: pd.DataFrame,
+    center_lat: float,
+    center_lon: float,
+    min_conflictivity: float = 0.0,
+    radius: int = 15,
+    zoom: int = 15,
+) -> go.Figure:
+    """Create heatmap with clickable AP points."""
+    df_with_location = df.copy()
+    df_with_location["location_key"] = (
+        df_with_location["lat"].round(6).astype(str)
+        + ","
+        + df_with_location["lon"].round(6).astype(str)
+    )
+
+    location_groups = df_with_location.groupby("location_key").agg(
+        lat=("lat", "first"),
+        lon=("lon", "first"),
+        name=("name", lambda x: list(x)),
+        conflictivity=("conflictivity", lambda x: list(x)),
+        client_count=("client_count", lambda x: list(x) if "client_count" in df.columns else None),
+        max_radio_util=("max_radio_util", lambda x: list(x) if "max_radio_util" in df.columns else None),
+    ).reset_index()
+
+    location_groups["max_conflictivity"] = location_groups["conflictivity"].apply(max)
+    location_groups["ap_count"] = location_groups["name"].apply(len)
+    
+    location_groups = location_groups[location_groups["max_conflictivity"] >= min_conflictivity]
+    location_groups = location_groups.sort_values("max_conflictivity", ascending=True)
+
+    hover_texts = []
+    ap_names_list = []
+    for _, row in location_groups.iterrows():
+        ap_data = sorted(
+            zip(
+                row["name"],
+                row["conflictivity"],
+                (row["client_count"] or [None] * len(row["name"])),
+                (row["max_radio_util"] or [None] * len(row["name"])),
+            ),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        if len(ap_data) == 1:
+            n, conf, cli, util = ap_data[0]
+            t = f"<b>{n}</b><br>Conflictivity: {conf:.3f}"
+            if cli is not None:
+                t += f"<br>Clients: {int(cli)}"
+            if util is not None and not np.isnan(util):
+                t += f"<br>Radio Util: {util:.1f}%"
+            ap_names_list.append([n])
+        else:
+            t = f"<b>{len(ap_data)} APs at this location</b><br><br>"
+            names_at_location = []
+            for i, (n, conf, cli, util) in enumerate(ap_data):
+                t += f"<b>{n}</b><br>  Conflictivity: {conf:.3f}"
+                if cli is not None:
+                    t += f" | Clients: {int(cli)}"
+                if util is not None and not np.isnan(util):
+                    t += f" | Radio: {util:.1f}%"
+                if i < len(ap_data) - 1:
+                    t += "<br>"
+                names_at_location.append(n)
+            ap_names_list.append(names_at_location)
+        hover_texts.append(t)
+
+    fig = go.Figure(
+        go.Scattermapbox(
+            lat=location_groups["lat"],
+            lon=location_groups["lon"],
+            mode="markers",
+            marker=dict(
+                size=radius * 2,
+                color=location_groups["max_conflictivity"],
+                colorscale=[
+                    [0.0, "rgb(0, 255, 0)"],
+                    [0.5, "rgb(255, 165, 0)"],
+                    [1.0, "rgb(255, 0, 0)"],
+                ],
+                cmin=0,
+                cmax=1,
+                opacity=0.85,
+                showscale=True,
+                colorbar=dict(
+                    title="Conflictivity",
+                    thickness=15,
+                    len=0.7,
+                    tickmode="linear",
+                    tick0=0,
+                    dtick=0.2,
+                    tickformat=".1f",
+                ),
+            ),
+            text=hover_texts,
+            hovertemplate="%{text}<extra></extra>",
+            showlegend=False,
+            customdata=ap_names_list,
+        )
+    )
+
+    fig.update_layout(
+        mapbox=dict(
+            style="open-street-map",
+            center=dict(lat=center_lat, lon=center_lon),
+            zoom=zoom,
+        ),
+        margin=dict(l=10, r=10, t=30, b=10),
+        height=700,
+    )
+    return fig
+
+# ======== VORONOI MODE FUNCTIONS (from conflictivity_dashboard_interpolation.py) ========
+
 def _compute_convex_hull_polygon(lons: np.ndarray, lats: np.ndarray):
     """Return a shapely Polygon of the convex hull, or None if degenerate."""
     pts = [Point(xy) for xy in zip(lons, lats)]
@@ -395,135 +510,352 @@ def _uab_tiled_choropleth_layer(df_uab: pd.DataFrame, *, tile_meters: float = 7.
         z=z_pred,
         colorscale=colorscale,
         zmin=0, zmax=1,
-        marker_opacity=0.7,
+        marker_opacity=0.9,
         marker_line_width=0,
         showscale=True,
-        colorbar=dict(title=colorbar_title, thickness=15, len=0.7, x=1.02),
-        name="Interpolated surface",
-        hovertemplate='Conflictivity: %{z:.2f}<extra></extra>',
+        colorbar=dict(title=colorbar_title, thickness=15, len=0.7),
+        name="UAB tiles",
     )
 
     return ch, effective_tile_meters, hull_poly
 
-def create_optimized_heatmap(
-    df: pd.DataFrame,
-    center_lat: float,
-    center_lon: float,
-    min_conflictivity: float = 0.0,
-    radius: int = 15,
-    zoom: int = 15,
-) -> go.Figure:
-    """Create heatmap with clickable AP points."""
-    df_with_location = df.copy()
-    df_with_location["location_key"] = (
-        df_with_location["lat"].round(6).astype(str)
-        + ","
-        + df_with_location["lon"].round(6).astype(str)
-    )
+def _inverted_weighted_voronoi_edges(df: pd.DataFrame, *, weight_col: str = "conflictivity",
+                                     radius_m: float = 25.0, clip_polygon=None,
+                                     tolerance_m: float = 8.0):
+    """Compute weighted Voronoi graph edges."""
+    if df.empty or weight_col not in df.columns:
+        return []
+    pts_lon = df["lon"].to_numpy(dtype=float)
+    pts_lat = df["lat"].to_numpy(dtype=float)
+    base = pd.to_numeric(df[weight_col], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    mn, mx = float(base.min()), float(base.max())
+    norm = (base - mn) / (mx - mn + 1e-12)
+    inv_w = 1.0 - norm
 
-    location_groups = df_with_location.groupby("location_key").agg(
-        lat=("lat", "first"),
-        lon=("lon", "first"),
-        name=("name", lambda x: list(x)),
-        conflictivity=("conflictivity", lambda x: list(x)),
-        client_count=("client_count", lambda x: list(x) if "client_count" in df.columns else None),
-        max_radio_util=("max_radio_util", lambda x: list(x) if "max_radio_util" in df.columns else None),
-    ).reset_index()
+    if len(pts_lon) < 3:
+        return []
+    try:
+        from scipy.spatial import Voronoi
+    except Exception:
+        return []
+    pts = np.column_stack([pts_lon, pts_lat])
+    try:
+        uniq, counts = np.unique(pts, axis=0, return_counts=True)
+        if np.any(counts > 1):
+            rng = np.random.RandomState(0)
+            pts = pts + rng.randn(*pts.shape) * 1e-8
+    except Exception:
+        pass
+    vor = Voronoi(pts)
 
-    location_groups["max_conflictivity"] = location_groups["conflictivity"].apply(max)
-    location_groups["ap_count"] = location_groups["name"].apply(len)
-    
-    location_groups = location_groups[location_groups["max_conflictivity"] >= min_conflictivity]
-    location_groups = location_groups.sort_values("max_conflictivity", ascending=True)
+    edges = []
+    def _adiff(lon, lat, i1, i2):
+        d1 = _haversine_m(lat, lon, pts_lat[i1], pts_lon[i1])
+        d2 = _haversine_m(lat, lon, pts_lat[i2], pts_lon[i2])
+        return abs((d1 - inv_w[i1] * max(radius_m, 1e-6)) - (d2 - inv_w[i2] * max(radius_m, 1e-6)))
 
-    hover_texts = []
-    ap_names_list = []
-    for _, row in location_groups.iterrows():
-        ap_data = sorted(
-            zip(
-                row["name"],
-                row["conflictivity"],
-                (row["client_count"] or [None] * len(row["name"])),
-                (row["max_radio_util"] or [None] * len(row["name"])),
-            ),
-            key=lambda x: x[1],
-            reverse=True,
-        )
-        if len(ap_data) == 1:
-            n, conf, cli, util = ap_data[0]
-            t = f"<b>{n}</b><br>Conflictivity: {conf:.3f}"
-            if cli is not None:
-                t += f"<br>Clients: {int(cli)}"
-            if util is not None and not np.isnan(util):
-                t += f"<br>Radio Util: {util:.1f}%"
-            ap_names_list.append([n])
+    def _keep_and_clip_segment(a, b, i1, i2):
+        seg = LineString([a, b])
+        geom = seg if clip_polygon is None else seg.intersection(clip_polygon)
+        if geom.is_empty:
+            return []
+        parts = []
+        if geom.geom_type == 'LineString':
+            parts = [geom]
+        elif geom.geom_type == 'MultiLineString':
+            parts = list(geom.geoms)
+        kept = []
+        for ls in parts:
+            coords = list(ls.coords)
+            if len(coords) < 2:
+                continue
+            K = 7
+            min_diff = float('inf')
+            for t in np.linspace(0.1, 0.9, K):
+                x = coords[0][0] * (1 - t) + coords[-1][0] * t
+                y = coords[0][1] * (1 - t) + coords[-1][1] * t
+                min_diff = min(min_diff, _adiff(x, y, i1, i2))
+            if min_diff < tolerance_m:
+                (ax, ay), (bx, by) = coords[0], coords[-1]
+                kept.append((ax, ay, bx, by))
+        return kept
+
+    for (p1, p2), rv in zip(vor.ridge_points, vor.ridge_vertices):
+        if -1 not in rv:
+            vcoords = vor.vertices[rv]
+            lon1, lat1 = float(vcoords[0][0]), float(vcoords[0][1])
+            lon2, lat2 = float(vcoords[1][0]), float(vcoords[1][1])
+            kept = _keep_and_clip_segment((lon1, lat1), (lon2, lat2), p1, p2)
+            edges.extend(kept)
         else:
-            t = f"<b>{len(ap_data)} APs at this location</b><br><br>"
-            names_at_location = []
-            for i, (n, conf, cli, util) in enumerate(ap_data):
-                t += f"<b>{n}</b><br>  Conflictivity: {conf:.3f}"
-                if cli is not None:
-                    t += f" | Clients: {int(cli)}"
-                if util is not None and not np.isnan(util):
-                    t += f" | Radio: {util:.1f}%"
-                if i < len(ap_data) - 1:
-                    t += "<br>"
-                names_at_location.append(n)
-            ap_names_list.append(names_at_location)
-        hover_texts.append(t)
+            vs = [v for v in rv if v != -1]
+            if not vs:
+                continue
+            v0 = vor.vertices[vs[0]]
+            lon0, lat0 = float(v0[0]), float(v0[1])
+            p1_xy = pts[[p1]][0]
+            p2_xy = pts[[p2]][0]
+            t = p2_xy - p1_xy
+            dir_vec = np.array([t[1], -t[0]], dtype=float)
+            nrm = np.linalg.norm(dir_vec)
+            if nrm == 0:
+                continue
+            dir_vec /= nrm
+            center = pts.mean(axis=0)
+            mid = (p1_xy + p2_xy) / 2.0
+            if np.dot(mid - center, dir_vec) < 0:
+                dir_vec *= -1.0
+            if clip_polygon is None:
+                continue
+            minx, miny, maxx, maxy = clip_polygon.bounds
+            L = max(maxx - minx, maxy - miny) * 5.0 + 1e-6
+            far = np.array([lon0, lat0]) + dir_vec * L
+            ray = LineString([(lon0, lat0), (float(far[0]), float(far[1]))])
+            inter = ray.intersection(clip_polygon)
+            if inter.is_empty:
+                continue
+            def _add_segment_from_linestring(ls):
+                coords = list(ls.coords)
+                if len(coords) >= 2:
+                    kept = _keep_and_clip_segment(coords[0], coords[-1], p1, p2)
+                    edges.extend(kept)
+            if inter.geom_type == 'LineString':
+                _add_segment_from_linestring(inter)
+            elif inter.geom_type == 'MultiLineString':
+                for ls in inter.geoms:
+                    _add_segment_from_linestring(ls)
 
-    fig = go.Figure()
-    
-    # Add scatter points for APs
-    fig.add_trace(go.Scattermapbox(
-        lat=location_groups["lat"],
-        lon=location_groups["lon"],
-        mode="markers",
-        marker=dict(
-            size=radius * 2,
-            color=location_groups["max_conflictivity"],
-            colorscale=[
-                [0.0, "rgb(0, 255, 0)"],
-                [0.5, "rgb(255, 165, 0)"],
-                [1.0, "rgb(255, 0, 0)"],
-            ],
-            cmin=0,
-            cmax=1,
-            opacity=0.85,
-            showscale=True,
-            colorbar=dict(
-                title="AP Conflictivity",
-                thickness=15,
-                len=0.7,
-                tickmode="linear",
-                tick0=0,
-                dtick=0.2,
-                tickformat=".1f",
-                x=0.98,
-            ),
-        ),
-        text=hover_texts,
-        hovertemplate="%{text}<extra></extra>",
-        showlegend=False,
-        customdata=ap_names_list,
-        name="Access Points",
-    ))
+    if clip_polygon is not None:
+        clipped = []
+        for (x1, y1, x2, y2) in edges:
+            seg = LineString([(x1, y1), (x2, y2)])
+            inter = seg.intersection(clip_polygon)
+            if inter.is_empty:
+                continue
+            if inter.geom_type == 'LineString':
+                coords = list(inter.coords)
+                if len(coords) >= 2:
+                    (ax, ay), (bx, by) = coords[0], coords[-1]
+                    clipped.append((ax, ay, bx, by))
+            elif inter.geom_type == 'MultiLineString':
+                for seg2 in inter.geoms:
+                    coords = list(seg2.coords)
+                    if len(coords) >= 2:
+                        (ax, ay), (bx, by) = coords[0], coords[-1]
+                        clipped.append((ax, ay, bx, by))
+        edges = clipped
+    return edges
 
-    fig.update_layout(
-        mapbox=dict(
-            style="open-street-map",
-            center=dict(lat=center_lat, lon=center_lon),
-            zoom=zoom,
-        ),
-        margin=dict(l=10, r=10, t=30, b=10),
-        height=700,
-    )
-    return fig
+def _top_conflictive_voronoi_vertices(df: pd.DataFrame, *, radius_m: float, coverage_poly: Polygon, k: int = 3) -> list:
+    """Return top-k Voronoi vertices with highest conflictivity score."""
+    if df.empty:
+        return []
+    try:
+        from scipy.spatial import Voronoi
+    except Exception:
+        return []
+    pts_lon = df["lon"].to_numpy(float)
+    pts_lat = df["lat"].to_numpy(float)
+    cvals = df["conflictivity"].to_numpy(float)
+    if len(pts_lon) < 3:
+        return []
+    pts = np.column_stack([pts_lon, pts_lat])
+    try:
+        uniq, counts = np.unique(pts, axis=0, return_counts=True)
+        if np.any(counts > 1):
+            rng = np.random.RandomState(7)
+            pts = pts + rng.randn(*pts.shape) * 1e-8
+    except Exception:
+        pass
+    vor = Voronoi(pts)
+    cand = []
+    for v in vor.vertices:
+        lon, lat = float(v[0]), float(v[1])
+        p = Point(lon, lat)
+        if not coverage_poly.contains(p):
+            continue
+        dists = _haversine_m(lat, lon, pts_lat, pts_lon)
+        dmin = dists.min()
+        boundary_conf = 1.0 if dmin >= radius_m else (dmin / max(radius_m, 1e-6))
+        W = _interp_kernel(dists, radius_m, mode="decay")
+        denom = W.sum()
+        if denom <= 0:
+            continue
+        weighted_conf = float((W * cvals).sum() / denom)
+        combined = max(weighted_conf, boundary_conf)
+        if boundary_conf >= 0.98 and weighted_conf < 0.5:
+            continue
+        cand.append((lon, lat, combined))
+    cand.sort(key=lambda t: t[2], reverse=True)
+    return cand[:max(0, int(k or 0))]
+
+def _snap_and_connect_edges(segments: list, clip_polygon: Polygon,
+                            *, lat0: float, snap_m: float = 2.0, join_m: float = 4.0):
+    """Post-process Voronoi segments to enforce connectivity."""
+    if not segments or clip_polygon is None:
+        return None
+    try:
+        from shapely.geometry import MultiLineString, MultiPoint
+    except Exception:
+        return None
+
+    meters_per_deg_lat = 111_320.0
+    meters_per_deg_lon = 111_320.0 * np.cos(np.deg2rad(lat0))
+    tol_deg = max(snap_m / max(meters_per_deg_lat, 1e-6), snap_m / max(meters_per_deg_lon, 1e-6))
+    join_deg = max(join_m / max(meters_per_deg_lat, 1e-6), join_m / max(meters_per_deg_lon, 1e-6))
+
+    lines = [LineString([(x1, y1), (x2, y2)]) for (x1, y1, x2, y2) in segments]
+    mls = MultiLineString(lines)
+
+    endpoints = []
+    for (x1, y1, x2, y2) in segments:
+        endpoints.append((x1, y1))
+        endpoints.append((x2, y2))
+    mp = MultiPoint(endpoints)
+    target = unary_union([mp, clip_polygon.boundary])
+
+    snapped = snap(mls, target, tol_deg)
+    clipped = snapped.intersection(clip_polygon)
+    if clipped.is_empty:
+        return None
+    if clipped.geom_type in ("Point", "MultiPoint"):
+        return None
+
+    def _collect_endpoints(geom):
+        pts = []
+        if geom.is_empty:
+            return pts
+        if geom.geom_type == 'LineString':
+            coords = list(geom.coords)
+            if len(coords) >= 2:
+                pts.append(tuple(coords[0]))
+                pts.append(tuple(coords[-1]))
+        elif geom.geom_type == 'MultiLineString':
+            for ls in geom.geoms:
+                coords = list(ls.coords)
+                if len(coords) >= 2:
+                    pts.append(tuple(coords[0]))
+                    pts.append(tuple(coords[-1]))
+        return pts
+
+    def _quantize(pt, q):
+        return (round(pt[0] / q) * q, round(pt[1] / q) * q)
+
+    pts = _collect_endpoints(clipped)
+    if not pts:
+        try:
+            merged = linemerge(unary_union(clipped))
+            return merged
+        except Exception:
+            return None
+
+    deg = defaultdict(int)
+    for p in pts:
+        deg[_quantize(p, tol_deg)] += 1
+
+    dangling = []
+    for p in pts:
+        qp = _quantize(p, tol_deg)
+        if deg[qp] == 1:
+            if Point(p).distance(clip_polygon.boundary) <= tol_deg * 1.5:
+                continue
+            dangling.append(p)
+
+    added_connectors = []
+    if dangling:
+        for p in dangling:
+            best = None
+            best_d = 1e9
+            for q in pts:
+                if q == p:
+                    continue
+                d = ((p[0]-q[0])**2 + (p[1]-q[1])**2) ** 0.5
+                if d < best_d:
+                    best_d = d
+                    best = q
+            if best is not None and best_d <= join_deg:
+                seg = LineString([p, best])
+                inter = seg.intersection(clip_polygon)
+                if not inter.is_empty:
+                    if inter.geom_type == 'LineString':
+                        added_connectors.append(inter)
+                    elif inter.geom_type == 'MultiLineString':
+                        for ls in inter.geoms:
+                            added_connectors.append(ls)
+
+    def _only_lines(g):
+        lines = []
+        if g is None or g.is_empty:
+            return lines
+        if g.geom_type == 'LineString':
+            lines.append(g)
+        elif g.geom_type == 'MultiLineString':
+            for ls in g.geoms:
+                if len(list(ls.coords)) >= 2:
+                    lines.append(ls)
+        return lines
+
+    all_lines = _only_lines(clipped)
+    if added_connectors:
+        for ac in added_connectors:
+            all_lines.extend(_only_lines(ac))
+    if not all_lines:
+        return None
+    try:
+        merged = linemerge(unary_union(all_lines))
+        return merged
+    except Exception:
+        return None
+
+def _coverage_regions_from_uab_tiles(uab_df: pd.DataFrame, tile_meters: float, radius_m: float,
+                                     max_tiles: int = 40000) -> list:
+    """Approximate coverage regions using tiling logic."""
+    if uab_df.empty:
+        return []
+    lons = uab_df["lon"].to_numpy(float)
+    lats = uab_df["lat"].to_numpy(float)
+    hull = _compute_convex_hull_polygon(lons, lats)
+    if hull is None:
+        return []
+    lat0 = float(np.mean(lats)) if len(lats) else 41.5
+    meters_per_deg_lat = 111_320.0
+    meters_per_deg_lon = 111_320.0 * np.cos(np.deg2rad(lat0))
+    dlat = tile_meters / meters_per_deg_lat
+    dlon = tile_meters / max(meters_per_deg_lon, 1e-6)
+    minx, miny, maxx, maxy = hull.bounds
+    lon_centers = np.arange(minx + dlon/2, maxx, dlon)
+    lat_centers = np.arange(miny + dlat/2, maxy, dlat)
+    XX, YY = np.meshgrid(lon_centers, lat_centers)
+    centers = np.column_stack([XX.ravel(), YY.ravel()])
+    poly_path = MplPath(np.vstack(hull.exterior.coords.xy).T)
+    inside = poly_path.contains_points(centers)
+    centers_in = centers[inside]
+    if centers_in.size == 0:
+        return []
+    dists = _haversine_m(centers_in[:,1][:,None], centers_in[:,0][:,None], lats[None,:], lons[None,:])
+    d_min = dists.min(axis=1)
+    covered_mask = d_min < radius_m
+    covered_centers = centers_in[covered_mask]
+    if covered_centers.size == 0:
+        return []
+    tile_polys = []
+    for (cx, cy) in covered_centers:
+        lon0, lon1 = cx - dlon/2, cx + dlon/2
+        lat0, lat1 = cy - dlat/2, cy + dlat/2
+        tile_polys.append(Polygon([(lon0, lat0), (lon1, lat0), (lon1, lat1), (lon0, lat1)]))
+    merged = unary_union(tile_polys)
+    polys = []
+    if merged.geom_type == 'Polygon':
+        polys = [merged]
+    elif merged.geom_type == 'MultiPolygon':
+        polys = list(merged.geoms)
+    final_polys = [p for p in polys if p.area > 0]
+    return final_polys
 
 # -------- UI --------
 st.set_page_config(page_title="UAB Wi‑Fi Integrated Dashboard", page_icon="📶", layout="wide")
 st.title("UAB Wi‑Fi Integrated Dashboard")
-st.caption("Time series visualization • Interpolated surfaces + Clickable heatmap with AI analysis")
+st.caption("AI Heatmap + Voronoi Analysis • Time series visualization")
 
 # Data availability checks
 if not AP_DIR.exists():
@@ -542,6 +874,15 @@ geo_df = read_geoloc_points(GEOJSON_PATH)
 
 # Sidebar
 with st.sidebar:
+    st.header("Visualization Mode")
+    viz_mode = st.radio(
+        "Select Mode",
+        options=["AI Heatmap", "Voronoi"],
+        index=0,
+        help="AI Heatmap: Click APs for AINA analysis | Voronoi: Interpolated surfaces with connectivity"
+    )
+    
+    st.divider()
     st.header("Time Navigation")
     default_idx = len(snapshots) - 1
     selected_idx = st.slider(
@@ -563,13 +904,6 @@ with st.sidebar:
     st.divider()
     st.header("Visualization Settings")
     
-    viz_mode = st.radio(
-        "Visualization Mode",
-        options=["Heatmap (clickable)", "Interpolated Tiles", "Both"],
-        index=2,
-        help="Choose between AP heatmap points, interpolated surface, or both"
-    )
-    
     band_mode = st.radio(
         "Band Mode",
         options=["worst", "avg", "2.4GHz", "5GHz"],
@@ -578,18 +912,36 @@ with st.sidebar:
         horizontal=True,
     )
     
-    if viz_mode in ["Interpolated Tiles", "Both"]:
-        radius_m = st.slider("Interpolation radius (m)", 5, 60, 25, step=5,
-                           help="Distance for interpolation kernel")
-        tile_meters = st.slider("Tile size (m)", 3, 15, 7, step=1,
-                              help="Size of each interpolation tile")
-    else:
-        radius_m = 25
-        tile_meters = 7
-    
-    radius = 5  # Fixed heatmap point radius
-    min_conf = st.slider("Minimum conflictivity", 0.0, 1.0, 0.0, 0.01)
-    top_n = st.slider("Top N listing (table)", 5, 50, 15, step=5)
+    # Mode-specific controls
+    if viz_mode == "AI Heatmap":
+        radius = 5
+        min_conf = st.slider("Minimum conflictivity", 0.0, 1.0, 0.0, 0.01)
+        top_n = st.slider("Top N listing (table)", 5, 50, 15, step=5)
+    else:  # Voronoi
+        radius_m = st.slider("Radi de connectivitat (m)", 5, 60, 25, step=5,
+                           help="Distància màxima perquè la connectivitat arribi a 1")
+        value_mode = st.selectbox("Mode de valor", ["conflictivity", "connectivity"], index=0,
+                                help="conflictivity: ponderació dels APs; connectivity: creix fins a 1 al radi")
+        TILE_M_FIXED = 7.0
+        MAX_TILES_NO_LIMIT = 1_000_000_000
+        
+        st.divider()
+        st.header("Voronoi ponderat")
+        show_awvd = st.checkbox("Mostrar arestes Voronoi ponderat", value=False,
+                              help="Aproximació additivament ponderada (edges)")
+        weight_source = st.selectbox(
+            "Base connectivitat (per invertir)",
+            ["conflictivity", "client_count", "max_radio_util", "airtime_score"],
+            index=0,
+            help="Es normalitza i s'inverteix: pes = 1 - norm(col)."
+        )
+        VOR_TOL_M_FIXED = 24.0
+        SNAP_M_DEFAULT = float(max(1.5, TILE_M_FIXED * 0.2))
+        JOIN_M_DEFAULT = float(max(3.0, TILE_M_FIXED * 0.6))
+        show_hot_vertex = st.checkbox("Marcar punt més conflictiu (vertex Voronoi)", value=False,
+                                    help="Evalua vertices del Voronoi i marca el de major conflictivitat.")
+        min_conf = 0.0
+        top_n = 15
 
 # Load and compute
 ap_df = read_ap_snapshot(selected_path, band_mode=band_mode)
@@ -626,7 +978,7 @@ if "chart_refresh_key" not in st.session_state:
 def on_dialog_close():
     st.session_state.chart_refresh_key += 1
 
-# Dialog function for AINA AI analysis
+# Dialog function for AINA AI analysis (used in AI Heatmap mode)
 @st.dialog("🤖 Anàlisi AINA AI", width="large")
 def show_aina_analysis(ap_name: str, ap_row: pd.Series):
     """Show AINA AI analysis in a modal dialog."""
@@ -827,84 +1179,258 @@ Si n'hi ha un numero alt d'ambos, doncs clarament el raonament es ambdos. Pero 2
         except Exception as e:
             st.error(f"❌ Error en la petició: {str(e)}")
 
-# Create figure based on visualization mode
-fig = go.Figure()
+# ========== VISUALIZATION LOGIC ==========
 
-# Add interpolated tiles if requested
-if viz_mode in ["Interpolated Tiles", "Both"]:
-    tmp = map_df.copy()
-    if "group_code" not in tmp.columns:
-        tmp["group_code"] = tmp["name"].apply(extract_group)
-    
-    # UAB interpolation (non-SAB)
-    uab_df = tmp[tmp["group_code"] != "SAB"].copy()
-    if not uab_df.empty:
-        ch, eff_tile, hull = _uab_tiled_choropleth_layer(
-            uab_df, tile_meters=tile_meters, radius_m=radius_m, mode="decay",
-            value_mode="conflictivity", max_tiles=40000
-        )
-        if ch is not None:
-            fig.add_trace(ch)
-
-# Add heatmap points if requested
-if viz_mode in ["Heatmap (clickable)", "Both"]:
-    heatmap_fig = create_optimized_heatmap(
+if viz_mode == "AI Heatmap":
+    # ========== AI HEATMAP MODE ==========
+    fig = create_optimized_heatmap(
         df=map_df,
         center_lat=center_lat,
         center_lon=center_lon,
         min_conflictivity=min_conf,
-        radius=radius,
+        radius=5,
         zoom=15,
     )
-    # Add heatmap trace to main figure
-    for trace in heatmap_fig.data:
-        fig.add_trace(trace)
 
-# Update layout
-fig.update_layout(
-    mapbox=dict(
-        style="open-street-map",
-        center=dict(lat=center_lat, lon=center_lon),
-        zoom=15,
-    ),
-    margin=dict(l=10, r=10, t=30, b=10),
-    height=700,
-    legend=dict(orientation="h", yanchor="bottom", y=0.02, xanchor="left", x=0.02)
-)
+    fig.update_layout(clickmode='event+select')
+    selected_points = st.plotly_chart(
+        fig, 
+        use_container_width=True, 
+        on_select="rerun",
+        key=f"ap_map_{st.session_state.chart_refresh_key}"
+    )
 
-# Handle map selection for AI analysis
-fig.update_layout(clickmode='event+select')
-selected_points = st.plotly_chart(
-    fig, 
-    use_container_width=True, 
-    on_select="rerun",
-    key=f"ap_map_{st.session_state.chart_refresh_key}"
-)
+    # Process selection and open dialog
+    if selected_points and "selection" in selected_points:
+        selection = selected_points["selection"]
+        if "points" in selection and len(selection["points"]) > 0:
+            point = selection["points"][0]
+            ap_name = None
+            
+            if "customdata" in point and point["customdata"]:
+                ap_names = point["customdata"]
+                if isinstance(ap_names, list) and len(ap_names) > 0:
+                    ap_name = ap_names[0] if isinstance(ap_names[0], str) else str(ap_names[0])
+            
+            if not ap_name and "text" in point:
+                text = point["text"]
+                name_match = re.search(r"<b>([^<]+)</b>", text)
+                if name_match:
+                    ap_name = name_match.group(1)
+            
+            if ap_name:
+                ap_data = merged[merged["name"] == ap_name]
+                if not ap_data.empty:
+                    show_aina_analysis(ap_name, ap_data.iloc[0])
 
-# Process selection and open dialog
-if selected_points and "selection" in selected_points:
-    selection = selected_points["selection"]
-    if "points" in selection and len(selection["points"]) > 0:
-        point = selection["points"][0]
-        ap_name = None
+else:
+    # ========== VORONOI MODE ==========
+    tmp = map_df.copy()
+    if "group_code" not in tmp.columns:
+        tmp["group_code"] = tmp["name"].apply(extract_group)
+    
+    sab_df = tmp[tmp["group_code"] == "SAB"].copy()
+    uab_df = tmp[tmp["group_code"] != "SAB"].copy()
+
+    fig = go.Figure()
+
+    # UAB interpolation
+    if not uab_df.empty:
+        ch, eff_tile, hull = _uab_tiled_choropleth_layer(
+            uab_df, tile_meters=TILE_M_FIXED, radius_m=radius_m, mode="decay",
+            value_mode=value_mode, max_tiles=MAX_TILES_NO_LIMIT
+        )
+        if ch is not None:
+            fig.add_trace(ch)
+            fig.add_annotation(text=f"UAB tile ≈ {eff_tile:.1f} m",
+                             showarrow=False, xref="paper", yref="paper",
+                             x=0.02, y=0.98, bgcolor="rgba(255,255,255,0.8)", bordercolor="#888", font=dict(size=10))
         
-        if "customdata" in point and point["customdata"]:
-            ap_names = point["customdata"]
-            if isinstance(ap_names, list) and len(ap_names) > 0:
-                ap_name = ap_names[0] if isinstance(ap_names[0], str) else str(ap_names[0])
-        
-        if not ap_name and "text" in point:
-            text = point["text"]
-            name_match = re.search(r"<b>([^<]+)</b>", text)
-            if name_match:
-                ap_name = name_match.group(1)
-        
-        if ap_name:
-            ap_data = merged[merged["name"] == ap_name]
-            if not ap_data.empty:
-                show_aina_analysis(ap_name, ap_data.iloc[0])
+        # AP points
+        fig.add_trace(go.Scattermapbox(
+            lat=uab_df['lat'], lon=uab_df['lon'], mode='markers',
+            marker=dict(size=7, color='black', opacity=0.7),
+            text=uab_df['name'], name="UAB APs",
+            hovertemplate='<b>%{text}</b><br>Conflictivity src point<extra></extra>'
+        ))
 
-# Top list
+    # Voronoi weighted edges
+    hot_vertices_info = None
+    if show_awvd:
+        aw_df = map_df[map_df["group_code"] != "SAB"].copy()
+        base_col = weight_source if weight_source in aw_df.columns else "conflictivity"
+        if not aw_df.empty and base_col in aw_df.columns:
+            regions = _coverage_regions_from_uab_tiles(
+                aw_df,
+                tile_meters=float(TILE_M_FIXED),
+                radius_m=radius_m,
+                max_tiles=int(MAX_TILES_NO_LIMIT)
+            )
+            union_poly = None
+            if regions:
+                union_poly = unary_union(regions)
+            else:
+                union_poly = _compute_convex_hull_polygon(aw_df["lon"].to_numpy(float), aw_df["lat"].to_numpy(float))
+
+            dedup = aw_df[["lon","lat", base_col]].copy()
+            dedup = (dedup.groupby(["lon","lat"], as_index=False)
+                           .agg({base_col: "max"}))
+
+            if union_poly is not None:
+                try:
+                    lat0 = float(aw_df["lat"].mean()) if len(aw_df) else 41.5
+                    meters_per_deg_lon = 111_320.0 * np.cos(np.deg2rad(lat0))
+                    eps_deg = (max(0.5, TILE_M_FIXED * 0.15)) / max(meters_per_deg_lon, 1e-6)
+                    union_poly = union_poly.buffer(eps_deg)
+                except Exception:
+                    pass
+
+            total_edges = _inverted_weighted_voronoi_edges(
+                dedup.rename(columns={base_col: base_col}),
+                weight_col=base_col,
+                radius_m=radius_m,
+                clip_polygon=union_poly,
+                tolerance_m=VOR_TOL_M_FIXED
+            ) if union_poly is not None and len(dedup) >= 3 else []
+
+            if total_edges:
+                lat0 = float(aw_df["lat"].mean()) if len(aw_df) else 41.5
+                merged_lines = _snap_and_connect_edges(
+                    total_edges,
+                    union_poly,
+                    lat0=lat0,
+                    snap_m=SNAP_M_DEFAULT,
+                    join_m=JOIN_M_DEFAULT,
+                ) or linemerge(unary_union([LineString([(x1, y1), (x2, y2)]) for (x1, y1, x2, y2) in total_edges]))
+                lons = []
+                lats = []
+                def add_lines(ls):
+                    coords = list(ls.coords)
+                    if len(coords) >= 2:
+                        for (x, y) in coords:
+                            lons.append(x)
+                            lats.append(y)
+                        lons.append(None)
+                        lats.append(None)
+                if merged_lines.geom_type == 'LineString':
+                    add_lines(merged_lines)
+                elif merged_lines.geom_type == 'MultiLineString':
+                    for ls in merged_lines.geoms:
+                        add_lines(ls)
+                fig.add_trace(go.Scattermapbox(
+                    lon=lons,
+                    lat=lats,
+                    mode='lines',
+                    line=dict(color='#0b3d91', width=2),
+                    name='Voronoi (ponderat, invertit)',
+                    hoverinfo='skip'
+                ))
+                
+                # Top hotspot vertices
+                if show_hot_vertex and union_poly is not None:
+                    topv = _top_conflictive_voronoi_vertices(aw_df, radius_m=radius_m, coverage_poly=union_poly, k=3)
+                    if topv:
+                        hot_vertices_info = [
+                            {"rank": i+1, "lon": v[0], "lat": v[1], "score": float(v[2])}
+                            for i, v in enumerate(topv)
+                        ]
+                        # Marker #1
+                        hv_lon, hv_lat, hv_score = topv[0]
+                        fig.add_trace(go.Scattermapbox(
+                            lon=[hv_lon], lat=[hv_lat], mode='markers',
+                            marker=dict(size=24, color='#ffffff', symbol='circle', opacity=0.95),
+                            hoverinfo='skip', showlegend=False
+                        ))
+                        fig.add_trace(go.Scattermapbox(
+                            lon=[hv_lon], lat=[hv_lat], mode='markers+text',
+                            marker=dict(
+                                size=18,
+                                color='#ff00ff',
+                                symbol='star',
+                                opacity=0.95
+                            ),
+                            text=["#1"], textposition='top center',
+                            textfont=dict(color='#ffffff', size=12, family='Arial Black'),
+                            name='Hotspot #1',
+                            hovertemplate='<b>#1 Hotspot</b><br>Score=%{customdata:.3f}<extra></extra>',
+                            customdata=[hv_score]
+                        ))
+                        # Markers #2-#3
+                        if len(topv) > 1:
+                            lons = [t[0] for t in topv[1:]]
+                            lats = [t[1] for t in topv[1:]]
+                            scores = [float(t[2]) for t in topv[1:]]
+                            labels = [f"#{i+2}" for i in range(len(lons))]
+                            fig.add_trace(go.Scattermapbox(
+                                lon=lons, lat=lats, mode='markers',
+                                marker=dict(size=20, color='#ffffff', symbol='circle', opacity=0.95),
+                                hoverinfo='skip', showlegend=False
+                            ))
+                            fig.add_trace(go.Scattermapbox(
+                                lon=lons, lat=lats, mode='markers+text',
+                                marker=dict(
+                                    size=16,
+                                    color='#00ffff',
+                                    symbol='star',
+                                    opacity=0.95
+                                ),
+                                text=labels, textposition='top center',
+                                textfont=dict(color='#ffffff', size=11, family='Arial Black'),
+                                name='Hotspot #2-#3',
+                                hovertemplate='<b>%{text}</b><br>Score=%{customdata:.3f}<extra></extra>',
+                                customdata=scores
+                            ))
+                
+            # Draw coverage hull
+            if union_poly is not None:
+                hull_lons = []
+                hull_lats = []
+                polys = [union_poly] if union_poly.geom_type == 'Polygon' else list(union_poly.geoms)
+                for reg in polys:
+                    xh, yh = reg.exterior.coords.xy
+                    hull_lons.extend(list(xh) + [None])
+                    hull_lats.extend(list(yh) + [None])
+                    for ring in reg.interiors:
+                        xi, yi = zip(*list(ring.coords))
+                        hull_lons.extend(list(xi) + [None])
+                        hull_lats.extend(list(yi) + [None])
+                if hull_lons:
+                    fig.add_trace(go.Scattermapbox(
+                        lon=hull_lons,
+                        lat=hull_lats,
+                        mode='lines',
+                        line=dict(color='#0b3d91', width=1),
+                        name='Coverage hulls',
+                        hoverinfo='skip'
+                    ))
+                n_regs = 1 if union_poly.geom_type == 'Polygon' else len(list(union_poly.geoms))
+                fig.add_annotation(text=f"Voronoi ponderat (edges) — {n_regs} regions", xref="paper", yref="paper", x=0.02, y=0.90,
+                                 showarrow=False, bgcolor="rgba(0,0,0,0.4)", font=dict(color='white', size=10))
+
+    fig.update_layout(
+        mapbox=dict(
+            style="open-street-map",
+            center=dict(lat=center_lat, lon=center_lon),
+            zoom=15,
+        ),
+        margin=dict(l=10, r=10, t=30, b=10),
+        height=700,
+        legend=dict(orientation="h", yanchor="bottom", y=0.02, xanchor="left", x=0.02)
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Table with top hotspot vertices
+    try:
+        if show_awvd and show_hot_vertex and hot_vertices_info:
+            st.subheader("Top vertices Voronoi més conflictius")
+            top_df = pd.DataFrame(hot_vertices_info)
+            top_df["score"] = top_df["score"].map(lambda x: f"{x:.3f}")
+            st.dataframe(top_df, use_container_width=True, hide_index=True)
+    except Exception:
+        pass
+
+# Top conflictive APs table (common to both modes)
 st.subheader("Top conflictive Access Points")
 filtered_for_table = map_df[map_df["conflictivity"] >= min_conf].copy()
 if filtered_for_table.empty:
@@ -935,10 +1461,17 @@ band_info = {
     "2.4GHz": "2.4 GHz only",
     "5GHz": "5 GHz only",
 }
-st.caption(
-    f"📻 Band mode: {band_info[band_mode]}  |  "
-    "💡 Conflictivity measures Wi-Fi stress by combining channel congestion (75%), number of connected devices (15%), and AP resource usage (10%)  |  "
-    "🟢 Low ↔ 🔴 High (0–1)  |  "
-    "👆 Selecciona un AP al mapa per analitzar-lo amb AINA AI"
-)
 
+if viz_mode == "AI Heatmap":
+    st.caption(
+        f"📻 Band mode: {band_info[band_mode]}  |  "
+        "💡 Conflictivity measures Wi-Fi stress by combining channel congestion (75%), number of connected devices (15%), and AP resource usage (10%)  |  "
+        "🟢 Low ↔ 🔴 High (0–1)  |  "
+        "👆 Selecciona un AP al mapa per analitzar-lo amb AINA AI"
+    )
+else:
+    st.caption(
+        f"📻 Band mode: {band_info[band_mode]}  |  "
+        "💡 Conflictivity ≈ 0.75×airtime + 0.15×clients + 0.05×CPU + 0.05×Memòria  |  "
+        "🎨 Escala: 🟢 Low → 🟡 Medium → 🔴 High (0–1)"
+    )
