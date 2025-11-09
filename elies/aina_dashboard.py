@@ -514,12 +514,16 @@ if "last_opened_ap" not in st.session_state:
     st.session_state.last_opened_ap = None
 if "dialog_just_dismissed" not in st.session_state:
     st.session_state.dialog_just_dismissed = False
+if "chart_key" not in st.session_state:
+    st.session_state.chart_key = 0
 
 # Function to clear selection when dialog is dismissed
 def clear_selection():
     st.session_state.selected_ap = None
     st.session_state.last_opened_ap = None
     st.session_state.dialog_just_dismissed = True
+    # Increment chart key to force recreation and clear selection
+    st.session_state.chart_key += 1
 
 # Dialog function for AINA AI analysis
 @st.dialog("🤖 Anàlisi AINA AI", on_dismiss=clear_selection)
@@ -729,7 +733,8 @@ Ara vull que em raonis si l'AP es conflictiu per
 
 # Handle map selection - make points selectable
 fig.update_layout(clickmode='event+select')
-selected_points = st.plotly_chart(fig, use_container_width=True, on_select="rerun", key="ap_map")
+# Use chart_key to force recreation when dialog is dismissed (clears selection)
+selected_points = st.plotly_chart(fig, use_container_width=True, on_select="rerun", key=f"ap_map_{st.session_state.chart_key}")
 
 # Process selection and open dialog
 if selected_points and "selection" in selected_points:
