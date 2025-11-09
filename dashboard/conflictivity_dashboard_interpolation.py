@@ -28,7 +28,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from shapely.geometry import Point, MultiPoint, LineString, Polygon
-from shapely.ops import unary_union, linemerge
+from shapely.ops import unary_union, linemerge, snap
 from matplotlib.path import Path as MplPath
 # No sklearn dependency: custom kernel-based interpolation
 
@@ -378,21 +378,46 @@ def _inverted_weighted_voronoi_edges(df: pd.DataFrame, *, weight_col: str = "con
     vor = Voronoi(pts)
 
     edges = []
+    def _adiff(lon, lat, i1, i2):
+        d1 = _haversine_m(lat, lon, pts_lat[i1], pts_lon[i1])
+        d2 = _haversine_m(lat, lon, pts_lat[i2], pts_lon[i2])
+        return abs((d1 - inv_w[i1] * max(radius_m, 1e-6)) - (d2 - inv_w[i2] * max(radius_m, 1e-6)))
+
+    def _keep_and_clip_segment(a, b, i1, i2):
+        seg = LineString([a, b])
+        geom = seg if clip_polygon is None else seg.intersection(clip_polygon)
+        if geom.is_empty:
+            return []
+        parts = []
+        if geom.geom_type == 'LineString':
+            parts = [geom]
+        elif geom.geom_type == 'MultiLineString':
+            parts = list(geom.geoms)
+        kept = []
+        for ls in parts:
+            coords = list(ls.coords)
+            if len(coords) < 2:
+                continue
+            # sample K points along this clipped part and test min additive diff
+            K = 7
+            min_diff = float('inf')
+            for t in np.linspace(0.1, 0.9, K):
+                x = coords[0][0] * (1 - t) + coords[-1][0] * t
+                y = coords[0][1] * (1 - t) + coords[-1][1] * t
+                min_diff = min(min_diff, _adiff(x, y, i1, i2))
+            if min_diff < tolerance_m:
+                (ax, ay), (bx, by) = coords[0], coords[-1]
+                kept.append((ax, ay, bx, by))
+        return kept
+
     for (p1, p2), rv in zip(vor.ridge_points, vor.ridge_vertices):
         if -1 not in rv:
             # Finite edge
             vcoords = vor.vertices[rv]  # shape (2,2)
-            lon1, lat1 = vcoords[0]
-            lon2, lat2 = vcoords[1]
-            # Heuristic: keep edge if additive distance ordering between p1 and p2 is stable
-            mid_lon = (lon1 + lon2) / 2.0
-            mid_lat = (lat1 + lat2) / 2.0
-            d1 = _haversine_m(mid_lat, mid_lon, pts_lat[p1], pts_lon[p1])
-            d2 = _haversine_m(mid_lat, mid_lon, pts_lat[p2], pts_lon[p2])
-            ad1 = d1 - inv_w[p1] * max(radius_m, 1e-6)
-            ad2 = d2 - inv_w[p2] * max(radius_m, 1e-6)
-            if abs(ad1 - ad2) < tolerance_m:  # tolerance (m)
-                edges.append((lon1, lat1, lon2, lat2))
+            lon1, lat1 = float(vcoords[0][0]), float(vcoords[0][1])
+            lon2, lat2 = float(vcoords[1][0]), float(vcoords[1][1])
+            kept = _keep_and_clip_segment((lon1, lat1), (lon2, lat2), p1, p2)
+            edges.extend(kept)
         else:
             # Infinite edge: extend ray to boundary and clip
             # Identify finite vertex
@@ -429,16 +454,8 @@ def _inverted_weighted_voronoi_edges(df: pd.DataFrame, *, weight_col: str = "con
             def _add_segment_from_linestring(ls):
                 coords = list(ls.coords)
                 if len(coords) >= 2:
-                    a, b = coords[0], coords[-1]
-                    # Additive heuristic at segment midpoint
-                    mid_lon = (a[0] + b[0]) / 2.0
-                    mid_lat = (a[1] + b[1]) / 2.0
-                    d1 = _haversine_m(mid_lat, mid_lon, pts_lat[p1], pts_lon[p1])
-                    d2 = _haversine_m(mid_lat, mid_lon, pts_lat[p2], pts_lon[p2])
-                    ad1 = d1 - inv_w[p1] * max(radius_m, 1e-6)
-                    ad2 = d2 - inv_w[p2] * max(radius_m, 1e-6)
-                    if abs(ad1 - ad2) < tolerance_m:
-                        edges.append((a[0], a[1], b[0], b[1]))
+                    kept = _keep_and_clip_segment(coords[0], coords[-1], p1, p2)
+                    edges.extend(kept)
             if inter.geom_type == 'LineString':
                 _add_segment_from_linestring(inter)
             elif inter.geom_type == 'MultiLineString':
@@ -466,6 +483,144 @@ def _inverted_weighted_voronoi_edges(df: pd.DataFrame, *, weight_col: str = "con
                         clipped.append((ax, ay, bx, by))
         edges = clipped
     return edges
+
+
+def _snap_and_connect_edges(segments: list[tuple[float,float,float,float]], clip_polygon: Polygon,
+                            *, lat0: float, snap_m: float = 2.0, join_m: float = 4.0):
+    """Post-process Voronoi segments to enforce connectivity.
+    - Snap endpoints to each other and to the clip polygon boundary within snap_m.
+    - Connect dangling endpoints (degree=1) that are inside the polygon and within join_m of another endpoint.
+
+    Returns a shapely LineString/MultiLineString geometry with merged lines.
+    """
+    if not segments or clip_polygon is None:
+        return None
+    try:
+        from shapely.geometry import MultiLineString, MultiPoint
+    except Exception:
+        return None
+
+    # Convert meters to degrees (approx)
+    meters_per_deg_lat = 111_320.0
+    meters_per_deg_lon = 111_320.0 * np.cos(np.deg2rad(lat0))
+    tol_deg = max(snap_m / max(meters_per_deg_lat, 1e-6), snap_m / max(meters_per_deg_lon, 1e-6))
+    join_deg = max(join_m / max(meters_per_deg_lat, 1e-6), join_m / max(meters_per_deg_lon, 1e-6))
+
+    lines = [LineString([(x1, y1), (x2, y2)]) for (x1, y1, x2, y2) in segments]
+    mls = MultiLineString(lines)
+
+    # Build target: endpoints + polygon boundary
+    endpoints = []
+    for (x1, y1, x2, y2) in segments:
+        endpoints.append((x1, y1))
+        endpoints.append((x2, y2))
+    mp = MultiPoint(endpoints)
+    target = unary_union([mp, clip_polygon.boundary])
+
+    # 1) Snap to endpoints and boundary, then clip to polygon
+    snapped = snap(mls, target, tol_deg)
+    clipped = snapped.intersection(clip_polygon)
+    # If clip produced Points or empty, bail early
+    if clipped.is_empty:
+        return None
+    if clipped.geom_type in ("Point", "MultiPoint"):
+        return None
+
+    # 2) Identify dangling endpoints (degree=1) far from boundary and connect to nearest endpoint
+    def _collect_endpoints(geom):
+        pts = []
+        if geom.is_empty:
+            return pts
+        if geom.geom_type == 'LineString':
+            coords = list(geom.coords)
+            if len(coords) >= 2:
+                pts.append(tuple(coords[0]))
+                pts.append(tuple(coords[-1]))
+        elif geom.geom_type == 'MultiLineString':
+            for ls in geom.geoms:
+                coords = list(ls.coords)
+                if len(coords) >= 2:
+                    pts.append(tuple(coords[0]))
+                    pts.append(tuple(coords[-1]))
+        return pts
+
+    def _quantize(pt, q):
+        return (round(pt[0] / q) * q, round(pt[1] / q) * q)
+
+    pts = _collect_endpoints(clipped)
+    if not pts:
+        try:
+            merged = linemerge(unary_union(clipped))
+            return merged
+        except Exception:
+            return None
+
+    # Count degrees by quantized endpoint
+    from collections import defaultdict
+    deg = defaultdict(int)
+    for p in pts:
+        deg[_quantize(p, tol_deg)] += 1
+
+    # Build a set of candidate dangling points
+    dangling = []
+    for p in pts:
+        qp = _quantize(p, tol_deg)
+        # Degree counting counts each appearance; endpoints of middle nodes may appear twice
+        if deg[qp] == 1:
+            # if close to boundary, treat as connected to hull
+            if Point(p).distance(clip_polygon.boundary) <= tol_deg * 1.5:
+                continue
+            dangling.append(p)
+
+    added_connectors = []
+    if dangling:
+        # Prepare spatial index: simple brute-force nearest as counts are small
+        for p in dangling:
+            # find nearest other endpoint within join_deg
+            best = None
+            best_d = 1e9
+            for q in pts:
+                if q == p:
+                    continue
+                d = ((p[0]-q[0])**2 + (p[1]-q[1])**2) ** 0.5
+                if d < best_d:
+                    best_d = d
+                    best = q
+            if best is not None and best_d <= join_deg:
+                seg = LineString([p, best])
+                # Clip and add only if inside polygon
+                inter = seg.intersection(clip_polygon)
+                if not inter.is_empty:
+                    if inter.geom_type == 'LineString':
+                        added_connectors.append(inter)
+                    elif inter.geom_type == 'MultiLineString':
+                        for ls in inter.geoms:
+                            added_connectors.append(ls)
+
+    # Ensure all added connectors are LineStrings
+    def _only_lines(g):
+        lines = []
+        if g is None or g.is_empty:
+            return lines
+        if g.geom_type == 'LineString':
+            lines.append(g)
+        elif g.geom_type == 'MultiLineString':
+            for ls in g.geoms:
+                if len(list(ls.coords)) >= 2:
+                    lines.append(ls)
+        return lines
+
+    all_lines = _only_lines(clipped)
+    if added_connectors:
+        for ac in added_connectors:
+            all_lines.extend(_only_lines(ac))
+    if not all_lines:
+        return None
+    try:
+        merged = linemerge(unary_union(all_lines))
+        return merged
+    except Exception:
+        return None
 
 
 def _compute_connectivity_components(df: pd.DataFrame, radius_m: float) -> list[tuple[pd.DataFrame, object]]:
@@ -943,6 +1098,10 @@ with st.sidebar:
         index=0,
         help="Es normalitza i s'inverteix: pes = 1 - norm(col)."
     )
+    # Paràmetres fixos per a AWVD (sense sliders)
+    VOR_TOL_M_FIXED = 24.0
+    SNAP_M_DEFAULT = float(max(1.5, TILE_M_FIXED * 0.2))
+    JOIN_M_DEFAULT = float(max(3.0, TILE_M_FIXED * 0.6))
 
 # Load data for selected timestamp
 ap_df = read_ap_snapshot(selected_path, band_mode=band_mode)
@@ -1031,13 +1190,19 @@ if show_awvd:
             weight_col=base_col,
             radius_m=radius_m,
             clip_polygon=union_poly,
-            tolerance_m=max(5.0, radius_m * 0.25)
+            tolerance_m=VOR_TOL_M_FIXED
         ) if union_poly is not None and len(dedup) >= 3 else []
 
         if total_edges:
-            # Merge small segments into continuous polylines to avoid tiny gaps
-            line_geoms = [LineString([(x1, y1), (x2, y2)]) for (x1, y1, x2, y2) in total_edges]
-            merged_lines = linemerge(unary_union(line_geoms))
+            # Post-process: snap and connect to enforce end-to-end connectivity
+            lat0 = float(aw_df["lat"].mean()) if len(aw_df) else 41.5
+            merged_lines = _snap_and_connect_edges(
+                total_edges,
+                union_poly,
+                lat0=lat0,
+                snap_m=SNAP_M_DEFAULT,
+                join_m=JOIN_M_DEFAULT,
+            ) or linemerge(unary_union([LineString([(x1, y1), (x2, y2)]) for (x1, y1, x2, y2) in total_edges]))
             lons = []
             lats = []
             def add_lines(ls):
