@@ -48,6 +48,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import requests
+from dotenv import load_dotenv
+import os
+
+# Load environment variables
+load_dotenv()
 
 # -------- Paths --------
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -619,7 +624,11 @@ if st.session_state.selected_ap:
 """
         
         # AINA AI API call
-        API_KEY = "zpka_4d26fbf3602644d1a719050b1f901e2f_0030d1b5"
+        API_KEY = os.getenv("AINA_API_KEY")
+        if not API_KEY:
+            st.error("❌ AINA_API_KEY no trobada a les variables d'entorn. Si us plau, crea un fitxer .env amb AINA_API_KEY=tu_api_key")
+            st.stop()
+        
         headers = {
             "Authorization": f"Bearer {API_KEY}",
             "Content-Type": "application/json",
