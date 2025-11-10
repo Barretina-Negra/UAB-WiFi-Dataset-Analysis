@@ -7,9 +7,9 @@ from typing import Dict, Any, List, Tuple
 import plotly.express as px
 
 # ---------- Config ----------
-AP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'realData', 'ap'))
-GEOJSON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'realData', 'geoloc', 'aps_geolocalizados_wgs84.geojson'))
-OUTPUT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'preview'))
+AP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..', 'realData', 'ap'))
+GEOJSON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..', 'realData', 'geoloc', 'aps_geolocalizados_wgs84.geojson'))
+OUTPUT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..', 'preview'))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 

@@ -43,7 +43,7 @@ except Exception:  # pragma: no cover
 
 
 # -------- Paths --------
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 AP_DIR = REPO_ROOT / "realData" / "ap"
 GEOJSON_PATH = REPO_ROOT / "realData" / "geoloc" / "aps_geolocalizados_wgs84.geojson"
 
