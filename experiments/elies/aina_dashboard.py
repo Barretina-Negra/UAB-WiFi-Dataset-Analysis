@@ -1,5 +1,5 @@
 """
-Enhanced Conflictivity Dashboard with Time Series Navigation
+Aina AI Enhanced Conflictivity Dashboard with Time Series Navigation
 
 Purpose
 - Show a heatmap of Wi-Fi conflictivity by AP on the UAB campus with time series navigation.
