@@ -35,15 +35,10 @@ import streamlit as st
 from shapely.geometry import Point, MultiPoint, LineString, Polygon
 from shapely.ops import unary_union, linemerge, snap
 from matplotlib.path import Path as MplPath
-try:
-    from scipy.spatial import Voronoi
-    _HAS_SCIPY_VORONOI = True
-except Exception:  # pragma: no cover
-    _HAS_SCIPY_VORONOI = False
 
 
 # -------- Paths --------
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 AP_DIR = REPO_ROOT / "realData" / "ap"
 GEOJSON_PATH = REPO_ROOT / "realData" / "geoloc" / "aps_geolocalizados_wgs84.geojson"
 
@@ -329,8 +324,9 @@ def _add_density_layer(fig: go.Figure, lon_grid, lat_grid, Z, *, name: str,
 
 def _uab_tiled_choropleth_layer(df_uab: pd.DataFrame, *, tile_meters: float = 3.0,
                                 radius_m: float = 25.0, mode: str = "decay",
+                                value_mode: str = "conflictivity",
                                 max_tiles: int = 40000, colorscale=None):
-    """Create a Choroplethmapbox layer of rectangular tiles (Conflictivity only)."""
+    """Create a Choroplethmapbox layer of rectangular tiles."""
     if colorscale is None:
         colorscale = [[0.0, 'rgb(0, 255, 0)'], [0.5, 'rgb(255, 255, 0)'], [1.0, 'rgb(255, 0, 0)']]
 
@@ -375,16 +371,21 @@ def _uab_tiled_choropleth_layer(df_uab: pd.DataFrame, *, tile_meters: float = 3.
         return None, effective_tile_meters, hull_poly
 
     dists = _haversine_m(centers_in[:, 1][:, None], centers_in[:, 0][:, None], lats[None, :], lons[None, :])
-    d_min = dists.min(axis=1)
-    boundary_conf = np.where(d_min >= radius_m, 1.0, d_min / max(radius_m, 1e-6))
-    cvals = df_uab["conflictivity"].to_numpy(dtype=float)
-    W = _interp_kernel(dists, radius_m, mode=mode)
-    denom = W.sum(axis=1)
-    with np.errstate(invalid='ignore', divide='ignore'):
-        num = (W * cvals[None, :]).sum(axis=1)
-        weighted_conf = np.where(denom > 0, num / denom, np.nan)
-    z_pred = np.maximum(weighted_conf, boundary_conf)
-    z_pred = np.clip(z_pred, 0.0, 1.0)
+
+    if value_mode == "connectivity":
+        d_min = dists.min(axis=1)
+        z_pred = np.clip(d_min / max(radius_m, 1e-6), 0.0, 1.0)
+    else:
+        d_min = dists.min(axis=1)
+        boundary_conf = np.where(d_min >= radius_m, 1.0, d_min / max(radius_m, 1e-6))
+        cvals = df_uab["conflictivity"].to_numpy(dtype=float)
+        W = _interp_kernel(dists, radius_m, mode=mode)
+        denom = W.sum(axis=1)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            num = (W * cvals[None, :]).sum(axis=1)
+            weighted_conf = np.where(denom > 0, num / denom, np.nan)
+        z_pred = np.maximum(weighted_conf, boundary_conf)
+        z_pred = np.clip(z_pred, 0.0, 1.0)
 
     features = []
     ids = []
@@ -403,7 +404,8 @@ def _uab_tiled_choropleth_layer(df_uab: pd.DataFrame, *, tile_meters: float = 3.
         ids.append(str(i))
 
     geojson = {"type": "FeatureCollection", "features": features}
-    colorbar_title = "Conflictivity (UAB tiles)"
+
+    colorbar_title = "Connectivity (UAB tiles)" if value_mode == "connectivity" else "Conflictivity (UAB tiles)"
     ch = go.Choroplethmapbox(
         geojson=geojson,
         locations=ids,
@@ -426,7 +428,7 @@ def create_dual_interpolated_map(df: pd.DataFrame, center_lat: float, center_lon
                                  tile_meters: float = 3.0,
                                  max_tiles: int = 40000,
                                  radius_m: float = 25.0, kernel_mode: str = "decay",
-                                 ) -> go.Figure:
+                                 value_mode: str = "conflictivity") -> go.Figure:
     """Create two separate interpolations: one for non-SAB (UAB) and one for SAB APs."""
     tmp = df.copy()
     if "group_code" not in tmp.columns:
@@ -440,7 +442,7 @@ def create_dual_interpolated_map(df: pd.DataFrame, center_lat: float, center_lon
     if show_uab and not uab_df.empty:
         ch, eff_tile, hull = _uab_tiled_choropleth_layer(
             uab_df, tile_meters=tile_meters, radius_m=radius_m, mode=kernel_mode,
-            max_tiles=max_tiles
+            value_mode=value_mode, max_tiles=max_tiles
         )
         if ch is not None:
             fig.add_trace(ch)
@@ -449,7 +451,7 @@ def create_dual_interpolated_map(df: pd.DataFrame, center_lat: float, center_lon
                                x=0.02, y=0.98, bgcolor="rgba(255,255,255,0.8)", bordercolor="#888", font=dict(size=10))
         else:
             g1_lon, g1_lat, g1_Z = _interpolate_conflictivity_kernel(uab_df, grid_size=160, radius_m=radius_m, mode=kernel_mode)
-            cb_title = "Conflictivity (UAB)"
+            cb_title = "Connectivity (UAB)" if value_mode == "connectivity" else "Conflictivity (UAB)"
             _add_density_layer(fig, g1_lon, g1_lat, g1_Z, name="UAB surface", showscale=True, colorbar_title=cb_title)
         fig.add_trace(go.Scattermapbox(
             lat=uab_df['lat'], lon=uab_df['lon'], mode='markers',
@@ -726,15 +728,11 @@ def generate_candidate_locations(
     conflictivity_threshold: float,
     radius_m: float,
     indoor_only: bool = True,
-    neighbor_radius_tiles: int = 1,
-    inner_clearance_m: float = 0.0,
 ) -> pd.DataFrame:
     """
     Generate candidate locations for new AP placement.
     Only selects tiles that are surrounded by other PAINTED tiles.
     A painted tile is one that appears in the visualization (inside hull with valid conflictivity).
-    Additional constraint: require a solid buffer of painted tiles of size `neighbor_radius_tiles`
-    around each candidate (i.e., morphological erosion with Chebyshev radius).
     """
     lons = df_aps['lon'].values
     lats = df_aps['lat'].values
@@ -771,7 +769,6 @@ def generate_candidate_locations(
         lats[None, :],
         lons[None, :]
     )
-    d_min = dists.min(axis=1)
     
     R_m = radius_m
     W = np.maximum(0, 1 - dists / R_m)
@@ -782,7 +779,7 @@ def generate_candidate_locations(
     
     with np.errstate(invalid='ignore', divide='ignore'):
         num = (W * cvals[None, :]).sum(axis=1)
-    z_pred = np.where(denom > 0, num / denom, 0.0)
+        z_pred = np.where(denom > 0, num / denom, 0.0)
     
     # Create a SET of painted tile coordinates (these are the tiles that appear in the viz)
     # Also create a grid for easy neighbor checking
@@ -803,60 +800,47 @@ def generate_candidate_locations(
     print(f"DEBUG: Total painted tiles: {len(painted_tiles)}")
     print(f"DEBUG: Grid shape: {conf_grid.shape}")
     
-    # Build neighbor offsets for a Chebyshev radius (square ring) of size neighbor_radius_tiles
-    # radius=1 -> 8-neighborhood; radius=2 -> 24 neighbors; etc.
+    # Now check which tiles have ALL 8 neighbors as painted tiles
     neighbor_offsets = [
-        (dy, dx)
-        for dy in range(-neighbor_radius_tiles, neighbor_radius_tiles + 1)
-        for dx in range(-neighbor_radius_tiles, neighbor_radius_tiles + 1)
-        if not (dy == 0 and dx == 0)
+        (-1, 0),  # N
+        (-1, 1),  # NE
+        (0, 1),   # E
+        (1, 1),   # SE
+        (1, 0),   # S
+        (1, -1),  # SW
+        (0, -1),  # W
+        (-1, -1), # NW
     ]
     
     valid_tiles_mask = np.zeros(len(centers_in), dtype=bool)
-    boundary_mask = np.zeros(len(centers_in), dtype=bool)
     
     for i, (lon, lat) in enumerate(centers_in):
         # Find grid position
         lon_idx = min(range(len(lon_centers)), key=lambda x: abs(lon_centers[x] - lon))
         lat_idx = min(range(len(lat_centers)), key=lambda x: abs(lat_centers[x] - lat))
         
-        # Determine neighbor presence set (8-neighborhood radius=1 always used for boundary test)
-        # Boundary if any of the immediate 8 neighbors is missing.
-        immediate_offsets = [
-            (-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1)
-        ]
-        is_boundary = False
-        for dy, dx in immediate_offsets:
-            n_lat = lat_idx + dy
-            n_lon = lon_idx + dx
-            if (n_lat, n_lon) not in painted_tiles:
-                is_boundary = True
-                break
-        boundary_mask[i] = is_boundary
-
-        # Interior validity: ALL neighbors within chosen radius must be painted
+        # Check if ALL 8 neighbors are painted tiles
         all_neighbors_painted = True
         for dlat_idx, dlon_idx in neighbor_offsets:
             neighbor_lat_idx = lat_idx + dlat_idx
             neighbor_lon_idx = lon_idx + dlon_idx
+            
+            # Neighbor must be in painted_tiles set
             if (neighbor_lat_idx, neighbor_lon_idx) not in painted_tiles:
                 all_neighbors_painted = False
                 break
-        if all_neighbors_painted and not is_boundary:
+        
+        if all_neighbors_painted:
             valid_tiles_mask[i] = True
     
-    print(f"DEBUG: Interior non-boundary tiles passing mask: {valid_tiles_mask.sum()}")
+    print(f"DEBUG: Tiles with all 8 neighbors painted: {valid_tiles_mask.sum()}")
     
     # Use only the strict interior mask (no separate boundary mask needed)
-    # Exclude tiles on/after the inner hull: points with distance to nearest AP >= (radius_m - inner_clearance_m)
-    inner_mask = d_min < max(0.0, radius_m - inner_clearance_m)
-    final_mask = valid_tiles_mask & inner_mask
+    final_mask = valid_tiles_mask
     
     # Filter to only truly interior tiles
     centers_in = centers_in[final_mask]
     z_pred = z_pred[final_mask]
-    boundary_mask = boundary_mask[final_mask]
-    d_min = d_min[final_mask]
     
     print(f"DEBUG: After all filtering: {len(centers_in)} tiles remain (from {valid_tiles_mask.size} total)")
     
@@ -867,157 +851,20 @@ def generate_candidate_locations(
         'lon': centers_in[:, 0],
         'lat': centers_in[:, 1],
         'conflictivity': z_pred,
-        'is_boundary': boundary_mask,
-        'min_dist_m': d_min,
     })
     
     print(f"DEBUG: Before conflictivity filter: {len(candidates)} candidates")
     
     # Filter by conflictivity threshold
-    candidates = candidates[(candidates['conflictivity'] >= conflictivity_threshold) & (~candidates['is_boundary'])].copy()
+    candidates = candidates[candidates['conflictivity'] >= conflictivity_threshold].copy()
     
     print(f"DEBUG: After conflictivity filter (>={conflictivity_threshold}): {len(candidates)} candidates")
     
-    candidates['reason'] = 'high_conflictivity_interior_non_boundary'
+    candidates['reason'] = 'high_conflictivity_interior'
     
     print(f"DEBUG: Final candidates returned: {len(candidates)}")
     
     return candidates.reset_index(drop=True)
-
-
-def generate_voronoi_candidates(
-    scenarios: list,
-    geo_df: pd.DataFrame,
-    radius_m: float,
-    conflictivity_threshold: float,
-    tile_radius_clearance_m: float,
-    merge_radius_m: float = 8.0,
-    max_vertices_per_scenario: int = 60,
-) -> pd.DataFrame:
-    """Generate AP candidate locations using Voronoi vertices across multiple scenarios.
-
-    Workflow per scenario:
-      1. Read snapshot, merge geoloc, exclude SAB.
-      2. Build Voronoi diagram of AP coordinates (lon/lat as planar approx OK at campus scale).
-      3. Keep vertices inside convex hull of AP set.
-      4. Interpolate conflictivity at vertex using same kernel (1 - d/R).
-      5. Filter by: distance to nearest AP < (radius_m - tile_radius_clearance_m) AND predicted conflictivity >= threshold.
-      6. Keep up to max_vertices_per_scenario highest conflictivity vertices.
-
-    Aggregation:
-      - Merge close vertices across scenarios (within merge_radius_m) using simple clustering.
-      - For each cluster accumulate: frequency (count of scenarios appeared), average & max conflictivity, average gap distance.
-
-    Returns DataFrame with columns:
-      lat, lon, avg_conflictivity, max_conflictivity, freq, avg_min_dist_m, scenarios (list)
-    """
-    if not _HAS_SCIPY_VORONOI:
-        st.error("SciPy not available: install scipy to enable Voronoi candidate mode.")
-        return pd.DataFrame()
-
-    records = []
-    # Precompute radius bound for inner clearance
-    effective_max_dist = max(0.0, radius_m - tile_radius_clearance_m)
-
-    for profile, snap_path, snap_dt in scenarios:
-        try:
-            df_snap = read_ap_snapshot(snap_path, band_mode='worst')
-            df_snap = df_snap.merge(geo_df, on='name', how='inner')
-            df_snap = df_snap[df_snap['group_code'] != 'SAB'].copy()
-            if df_snap.empty:
-                continue
-            pts_xy = df_snap[['lon', 'lat']].to_numpy()
-            if len(pts_xy) < 3:
-                continue
-            # Voronoi computation
-            vor = Voronoi(pts_xy)
-            # Convex hull polygon (Shapely) for inside test
-            hull_poly = MultiPoint([Point(xy) for xy in pts_xy]).convex_hull
-            # Iterate vertices
-            lons = df_snap['lon'].to_numpy()
-            lats = df_snap['lat'].to_numpy()
-            cvals = df_snap['conflictivity'].to_numpy()
-            for vidx, (vx, vy) in enumerate(vor.vertices):
-                p = Point(vx, vy)
-                if not hull_poly.contains(p):
-                    continue
-                # Distances to APs
-                dists = _haversine_m(vy, vx, lats, lons)
-                d_min = float(dists.min())
-                if d_min >= effective_max_dist:  # outside allowed interior ring
-                    continue
-                # Kernel weights
-                w = np.maximum(0.0, 1 - dists / radius_m)
-                w[dists >= radius_m] = 0.0
-                if w.sum() == 0:
-                    continue
-                conf_pred = float((w * cvals).sum() / w.sum())
-                if conf_pred < conflictivity_threshold:
-                    continue
-                records.append({
-                    'lon': vx,
-                    'lat': vy,
-                    'conflictivity': conf_pred,
-                    'min_dist_m': d_min,
-                    'scenario_ts': snap_dt,
-                    'stress_profile': profile.value,
-                })
-        except Exception as e:  # pragma: no cover
-            st.warning(f"Voronoi generation error for {snap_path.name}: {e}")
-            continue
-
-    if not records:
-        return pd.DataFrame()
-
-    df_all = pd.DataFrame(records)
-    # Keep top vertices per scenario timestamp if too many
-    df_all['scenario_key'] = df_all['scenario_ts'].astype(str)
-    df_all = df_all.sort_values(['scenario_key', 'conflictivity'], ascending=[True, False])
-    df_all = df_all.groupby('scenario_key').head(max_vertices_per_scenario).reset_index(drop=True)
-
-    # Simple clustering (greedy) by merge_radius_m using haversine distance
-    clusters = []  # each: dict with lat, lon, points list
-    merge_r = merge_radius_m
-    for row in df_all.itertuples():
-        placed = False
-        for cl in clusters:
-            d = _haversine_m(row.lat, row.lon, cl['lat'], cl['lon'])
-            if d <= merge_r:
-                cl['points'].append(row)
-                # Update centroid (mean) for stability
-                lats_cl = [p.lat for p in cl['points']]
-                lons_cl = [p.lon for p in cl['points']]
-                cl['lat'] = float(np.mean(lats_cl))
-                cl['lon'] = float(np.mean(lons_cl))
-                placed = True
-                break
-        if not placed:
-            clusters.append({'lat': row.lat, 'lon': row.lon, 'points': [row]})
-
-    out_rows = []
-    for cl in clusters:
-        pts = cl['points']
-        confs = [p.conflictivity for p in pts]
-        dmins = [p.min_dist_m for p in pts]
-        scenarios_list = [str(p.scenario_ts) for p in pts]
-        stress_profiles = [p.stress_profile for p in pts]
-        out_rows.append({
-            'lat': cl['lat'],
-            'lon': cl['lon'],
-            'avg_conflictivity': float(np.mean(confs)),
-            'max_conflictivity': float(np.max(confs)),
-            'freq': len(pts),
-            'avg_min_dist_m': float(np.mean(dmins)),
-            'scenarios': scenarios_list,
-            'stress_profiles': stress_profiles,
-        })
-
-    df_clusters = pd.DataFrame(out_rows)
-    # Rename for compatibility with later code expecting 'conflictivity'
-    df_clusters['conflictivity'] = df_clusters['avg_conflictivity']
-    # Sort: most frequent, then highest avg conflictivity
-    df_clusters = df_clusters.sort_values(['freq', 'avg_conflictivity'], ascending=[False, False]).reset_index(drop=True)
-    return df_clusters
 
 
 def simulate_ap_addition(
@@ -1138,44 +985,6 @@ def aggregate_scenario_results(
     return aggregated
 
 
-def simulate_multiple_ap_additions(
-    df_baseline: pd.DataFrame,
-    points: List[Dict],
-    config: SimulationConfig,
-) -> pd.DataFrame:
-    """Approximate combined effect of adding multiple APs by applying them sequentially.
-
-    For each point {lat, lon}, we redistribute clients, apply CCA interference, append a synthetic
-    new AP with estimated utilization, and recalculate conflictivity.
-    Returns the updated DataFrame including synthetic AP rows (group_code='SIM').
-    """
-    df_curr = df_baseline.copy()
-    for i, p in enumerate(points, start=1):
-        lat = float(p['lat'])
-        lon = float(p['lon'])
-        # Client redistribution
-        df_curr, new_ap_stats = estimate_client_distribution(df_curr, lat, lon, config, mode='hybrid')
-        # Apply interference to neighbors
-        df_curr = apply_cca_interference(df_curr, new_ap_stats, config)
-        # Append synthetic AP
-        new_row = {
-            'name': f'AP-NEW-SIM-{i}',
-            'group_code': 'SIM',
-            'lat': lat,
-            'lon': lon,
-            'client_count': new_ap_stats.get('client_count', 0),
-            'util_2g': new_ap_stats.get('util_2g', 0.0),
-            'util_5g': new_ap_stats.get('util_5g', 0.0),
-            'cpu_utilization': 0.0,
-            'mem_used_pct': 0.0,
-            'agg_util': max(new_ap_stats.get('util_2g', 0.0), new_ap_stats.get('util_5g', 0.0)),
-        }
-        df_curr = pd.concat([df_curr, pd.DataFrame([new_row])], ignore_index=True)
-        # Recompute conflictivity after each addition
-        df_curr = recalculate_conflictivity(df_curr)
-    return df_curr
-
-
 # -------- UI --------
 st.set_page_config(page_title="UAB Wi‑Fi Conflictivity & Simulator", page_icon="📶", layout="wide")
 st.title("UAB Wi‑Fi Conflictivity — Interpolated Surfaces & AP Placement Simulator")
@@ -1215,7 +1024,8 @@ with st.sidebar:
     st.divider()
     st.header("Visualization Settings")
 
-    # Connectivity mode removed; dashboard now always shows conflictivity interpolation.
+    value_mode = st.selectbox("Mode de valor", ["conflictivity", "connectivity"], index=0,
+                              help="conflictivity: ponderació dels APs; connectivity: creix fins a 1 al radi indicat")
     radius_m = st.slider("Radi de connectivitat (m)", 5, 60, 25, step=5,
                          help="Distància màxima perquè la connectivitat arribi a 1 (o decaigui a 0 en mode conflictivitat).")
     band_mode = st.radio(
@@ -1227,12 +1037,6 @@ with st.sidebar:
     )
     show_uab = st.checkbox("Mostrar UAB (no SAB)", value=True)
     show_sab = st.checkbox("Mostrar Sabadell (AP-SAB)", value=True)
-    # Quick control to reset any simulated map override
-    if st.session_state.get('map_override_df') is not None or st.session_state.get('new_node_markers'):
-        if st.button("Reset simulated map", help="Clear simulated results and return to baseline map"):
-            st.session_state.pop('map_override_df', None)
-            st.session_state.pop('new_node_markers', None)
-            st.rerun()
     
     TILE_M_FIXED = 7.0
     MAX_TILES_NO_LIMIT = 1_000_000_000
@@ -1269,27 +1073,6 @@ with st.sidebar:
                 help="More scenarios = more confidence, but slower"
             )
         
-        # Candidate placement filters
-        with st.expander("🎯 Candidate Filters", expanded=False):
-            st.caption("Control how far candidates must be from edges")
-            col_cf1, col_cf2 = st.columns(2)
-            with col_cf1:
-                sim_interior_buffer_tiles = st.slider(
-                    "Interior buffer (tiles)", 1, 4, 2,
-                    help="How many tile rings inside the painted area a candidate must be (avoids outer transparent edge)"
-                )
-            with col_cf2:
-                sim_inner_clearance_m = st.slider(
-                    "Clearance from radius band (m)", 0, int(radius_m), 10,
-                    help="Exclude tiles near the interpolation radius band (blue inner hull). Higher = farther from the red ring"
-                )
-            st.caption("**Experimental Mode**: Voronoi-based candidates")
-            use_voronoi_candidates = st.toggle(
-                "Use Voronoi vertex candidates (experimental)",
-                value=False,
-                help="Instead of interior tiles, aggregate Voronoi vertices across selected scenarios where conflictivity is high."
-            )
-        
         # Advanced options (collapsed by default)
         with st.expander("⚙️ Advanced Settings (Optional)", expanded=False):
             st.caption("**Physics Parameters**")
@@ -1310,11 +1093,11 @@ with st.sidebar:
                 st.caption("**Scoring Weights** (must sum to 1.0)")
                 w_worst = st.number_input("Worst AP", 0.0, 1.0, 0.30, 0.05, 
                                          help="Reduce worst-case overload")
-                w_avg = st.number_input("Average", 0.0, 1.0, 0.05, 0.05, 
+                w_avg = st.number_input("Average", 0.0, 1.0, 0.30, 0.05, 
                                        help="Overall network improvement")
-                w_cov = st.number_input("Coverage", 0.0, 1.0, 0.05, 0.05, 
+                w_cov = st.number_input("Coverage", 0.0, 1.0, 0.20, 0.05, 
                                        help="# of APs improved")
-                w_neigh = st.number_input("Neighborhood", 0.0, 1.0, 0.60, 0.05, 
+                w_neigh = st.number_input("Neighborhood", 0.0, 1.0, 0.20, 0.05, 
                                          help="Protect nearby APs")
             
             # Validate weights
@@ -1326,11 +1109,8 @@ with st.sidebar:
         if 'sim_interference_radius' not in locals():
             sim_interference_radius = 50
             sim_cca_increase = 0.15
-            w_worst, w_avg, w_cov, w_neigh = 0.30, 0.05, 0.05, 0.60
-            total_weight = w_worst + w_avg + w_cov + w_neigh
-            # Defaults for candidate filters if expander not opened
-            sim_interior_buffer_tiles = 2
-            sim_inner_clearance_m = 10
+            w_worst, w_avg, w_cov, w_neigh = 0.30, 0.30, 0.20, 0.20
+            total_weight = 1.0
         
         # Map stress profile to enum
         stress_display_map = {
@@ -1353,63 +1133,10 @@ with st.sidebar:
                 'w_avg': w_avg,
                 'w_cov': w_cov,
                 'w_neigh': w_neigh,
-                'interior_buffer_tiles': sim_interior_buffer_tiles,
-                'inner_clearance_m': sim_inner_clearance_m,
-                    'use_voronoi_candidates': 'use_voronoi_candidates' in locals() and use_voronoi_candidates,
             }
         else:
             if 'run_sim' not in st.session_state:
                 st.session_state.run_sim = False
-
-        # Voronoi Candidate Discovery (Step 1 of new workflow)
-        st.divider()
-        st.subheader("🧩 Voronoi Candidate Discovery")
-        st.caption("Detect stable high-conflictivity Voronoi vertex clusters across representative scenarios before full simulation.")
-        detect_voronoi = st.button("🔍 Detect Voronoi Vertices", disabled=not _HAS_SCIPY_VORONOI)
-        if detect_voronoi:
-            # Build scenarios similar to simulation preparation
-            stress_map = {
-                "HIGH": StressLevel.HIGH,
-                "CRITICAL": StressLevel.CRITICAL,
-                "MEDIUM": StressLevel.MEDIUM,
-                "LOW": StressLevel.LOW,
-                "ALL": None
-            }
-            target_stress = stress_map.get(sim_stress_profile_key, StressLevel.HIGH)
-            profiler = StressProfiler(
-                snapshots,
-                utilization_threshold_critical=85,  # use defaults already in class but explicit for clarity
-                utilization_threshold_high=70,
-            )
-            stress_profiles = profiler.classify_snapshots()
-            if target_stress is None:
-                profiles_to_test = [StressLevel.LOW, StressLevel.MEDIUM, StressLevel.HIGH, StressLevel.CRITICAL]
-            else:
-                profiles_to_test = [target_stress]
-            all_scenarios = []
-            for profile in profiles_to_test:
-                snaps_sel = profiler.get_representative_snapshots(profile, n_samples=sim_snapshots_per_profile)
-                for path, dt in snaps_sel:
-                    all_scenarios.append((profile, path, dt))
-            st.session_state.voronoi_scenarios = all_scenarios
-            if not all_scenarios:
-                st.warning("No scenarios available for Voronoi detection.")
-            else:
-                st.info(f"Voronoi: Using {len(all_scenarios)} scenarios across {len(profiles_to_test)} profiles.")
-                vor_df = generate_voronoi_candidates(
-                    all_scenarios,
-                    geo_df=geo_df,
-                    radius_m=radius_m,
-                    conflictivity_threshold=sim_threshold,
-                    tile_radius_clearance_m=sim_inner_clearance_m,
-                    merge_radius_m=8.0,
-                    max_vertices_per_scenario=60,
-                )
-                st.session_state.voronoi_candidates = vor_df
-                if vor_df.empty:
-                    st.warning("No Voronoi candidates detected. Try lowering conflictivity threshold or clearance.")
-                else:
-                    st.success(f"Detected {len(vor_df)} Voronoi candidate clusters.")
 
 # Load data for selected timestamp
 ap_df = read_ap_snapshot(selected_path, band_mode=band_mode)
@@ -1445,7 +1172,7 @@ map_df = merged.copy()
 center_lat = float(map_df["lat"].mean())
 center_lon = float(map_df["lon"].mean())
 
-# Create dual interpolated map (use override if present)
+# Create dual interpolated map
 fig = create_dual_interpolated_map(
     df=map_df,
     center_lat=center_lat,
@@ -1456,305 +1183,8 @@ fig = create_dual_interpolated_map(
     tile_meters=TILE_M_FIXED,
     max_tiles=MAX_TILES_NO_LIMIT,
     radius_m=radius_m,
+    value_mode=value_mode,
 )
-
-# Overlay Voronoi candidate markers if discovered
-if 'voronoi_candidates' in st.session_state and not st.session_state.voronoi_candidates.empty:
-    vor_df = st.session_state.voronoi_candidates
-    fig.add_trace(go.Scattermapbox(
-        lat=vor_df['lat'],
-        lon=vor_df['lon'],
-        mode='markers+text',
-        marker=dict(size=7, color='orange', opacity=0.85),
-        text=[f"AP-VOR-{i+1}" for i in range(len(vor_df))],
-        textposition="top center",
-        name='Voronoi Candidates',
-        hovertemplate='<b>%{text}</b><br>Avg Conflictivity: %{customdata[0]:.3f}<br>Freq: %{customdata[1]:.0f}<extra></extra>',
-        customdata=np.column_stack([vor_df['avg_conflictivity'], vor_df['freq']])
-    ))
-
-    # Show the map above the candidates table
-    st.plotly_chart(fig, use_container_width=True)
-    # Render a second map with the simulated surface, if available
-    if 'map_override_df' in st.session_state and st.session_state['map_override_df'] is not None:
-        sim_df = st.session_state['map_override_df']
-        fig_sim = create_dual_interpolated_map(
-            df=sim_df,
-            center_lat=center_lat,
-            center_lon=center_lon,
-            show_uab=show_uab,
-            show_sab=show_sab,
-            zoom=15,
-            tile_meters=TILE_M_FIXED,
-            max_tiles=MAX_TILES_NO_LIMIT,
-            radius_m=radius_m,
-        )
-        if 'new_node_markers' in st.session_state and st.session_state['new_node_markers']:
-            nn = st.session_state['new_node_markers']
-            fig_sim.add_trace(go.Scattermapbox(
-                lat=[p['lat'] for p in nn],
-                lon=[p['lon'] for p in nn],
-                mode='markers+text',
-                marker=dict(size=10, color='skyblue', opacity=0.95),
-                text=[p.get('label', 'AP-NEW') for p in nn],
-                textposition='top center',
-                name='New APs (simulated)',
-            ))
-        st.subheader("Simulated Map")
-        st.plotly_chart(fig_sim, use_container_width=True)
-    map_rendered = True
-
-    # Display candidate table with a central preview area above it
-    st.divider()
-    st.subheader("🧬 Voronoi Candidates")
-    st.caption("Click Simulate to evaluate adding an AP at that vertex across scenarios and preview map impact.")
-    sim_preview_container = st.container()
-    with sim_preview_container:
-        # If a simulation was requested, render the BEFORE/AFTER maps here
-        req = st.session_state.get('sim_preview_request')
-        if req:
-            try:
-                # Use current params or defaults
-                params = st.session_state.get('sim_params', {})
-                w_worst = params.get('w_worst', 0.30)
-                w_avg = params.get('w_avg', 0.05)
-                w_cov = params.get('w_cov', 0.05)
-                w_neigh = params.get('w_neigh', 0.60)
-                interference_radius = params.get('interference_radius', 50)
-                cca_increase = params.get('cca_increase', 0.15)
-                # Build scorer & config
-                cfg = SimulationConfig(
-                    interference_radius_m=interference_radius,
-                    cca_increase_factor=cca_increase,
-                    indoor_only=True,
-                    conflictivity_threshold_placement=params.get('threshold', 0.6),
-                    snapshots_per_profile=params.get('snapshots', 5),
-                    target_stress_profile=None,
-                    weight_worst_ap=w_worst,
-                    weight_average=w_avg,
-                    weight_coverage=w_cov,
-                    weight_neighborhood=w_neigh,
-                )
-                scorer = CompositeScorer(
-                    weight_worst_ap=w_worst,
-                    weight_average=w_avg,
-                    weight_coverage=w_cov,
-                    weight_neighborhood=w_neigh,
-                    neighborhood_mode=NeighborhoodOptimizationMode.BALANCED,
-                    interference_radius_m=interference_radius,
-                )
-                # Scenarios must exist
-                if 'voronoi_scenarios' not in st.session_state:
-                    st.error("No scenarios loaded. Detect Voronoi vertices first.")
-                else:
-                    single_results = []
-                    progress = st.progress(0.0)
-                    total = len(st.session_state.voronoi_scenarios)
-                    for i_s, (profile, snap_path, snap_dt) in enumerate(st.session_state.voronoi_scenarios, start=1):
-                        df_snap = read_ap_snapshot(snap_path, band_mode='worst').merge(geo_df, on='name', how='inner')
-                        df_snap = df_snap[df_snap['group_code'] != 'SAB'].copy()
-                        if df_snap.empty:
-                            continue
-                        _, new_ap_stats, metrics = simulate_ap_addition(
-                            df_snap,
-                            req['lat'],
-                            req['lon'],
-                            cfg,
-                            scorer,
-                        )
-                        metrics['stress_profile'] = profile.value
-                        metrics['timestamp'] = snap_dt
-                        single_results.append(metrics)
-                        progress.progress(i_s/total)
-                    progress.empty()
-                    if not single_results:
-                        st.warning("No simulation results produced.")
-                    else:
-                        agg = aggregate_scenario_results(req['lat'], req['lon'], req.get('base_conf', 0.0), single_results)
-                        st.success(f"Simulated AP-VOR-{req['idx']+1}: Final Score {agg['final_score']:.3f} ± {agg['score_std']:.3f}")
-                        # BEFORE / AFTER maps for latest selected snapshot
-                        df_prev_base = read_ap_snapshot(selected_path, band_mode='worst')
-                        df_prev_base = df_prev_base.merge(geo_df, on='name', how='inner')
-                        df_prev_base = df_prev_base[df_prev_base['group_code'] != 'SAB'].copy()
-                        fig_before = create_dual_interpolated_map(
-                            df=df_prev_base,
-                            center_lat=center_lat,
-                            center_lon=center_lon,
-                            show_uab=True,
-                            show_sab=False,
-                            zoom=15,
-                            tile_meters=TILE_M_FIXED,
-                            max_tiles=MAX_TILES_NO_LIMIT,
-                            radius_m=radius_m,
-                        )
-                        df_prev_after, new_ap_stats_tmp, _ = simulate_ap_addition(
-                            df_prev_base,
-                            req['lat'],
-                            req['lon'],
-                            cfg,
-                            scorer,
-                        )
-                        fig_after = create_dual_interpolated_map(
-                            df=df_prev_after,
-                            center_lat=center_lat,
-                            center_lon=center_lon,
-                            show_uab=True,
-                            show_sab=False,
-                            zoom=15,
-                            tile_meters=TILE_M_FIXED,
-                            max_tiles=MAX_TILES_NO_LIMIT,
-                            radius_m=radius_m,
-                        )
-                        fig_after.add_trace(go.Scattermapbox(
-                            lat=[req['lat']],
-                            lon=[req['lon']],
-                            mode='markers',
-                            marker=dict(size=11, color='cyan', opacity=0.9),
-                            name=f"AP-VOR-{req['idx']+1} (Simulated)",
-                            hovertemplate='<b>%{text}</b><extra></extra>',
-                            text=[f"AP-VOR-{req['idx']+1}"]
-                        ))
-                        col_before, col_after = st.columns(2)
-                        with col_before:
-                            st.caption("Before (latest snapshot)")
-                            st.plotly_chart(fig_before, use_container_width=True)
-                        with col_after:
-                            st.caption("After adding AP (latest snapshot)")
-                            st.plotly_chart(fig_after, use_container_width=True)
-                        # Clear/keep controls
-                        colc1, colc2 = st.columns([1,1])
-                        with colc1:
-                            if st.button("Clear preview"):
-                                st.session_state.pop('sim_preview_request', None)
-                        with colc2:
-                            st.caption("Tip: adjust weights or filters and re-run Simulate.")
-            except Exception as e:
-                st.warning(f"Preview rendering error: {e}")
-    # Selectable editor with checkbox column
-    display_vor = vor_df[['lat','lon','avg_conflictivity','max_conflictivity','freq','avg_min_dist_m']].copy()
-    display_vor.columns = ['Latitude','Longitude','Avg Conflict','Max Conflict','Freq','Avg Dist (m)']
-    display_vor['Idx'] = np.arange(len(display_vor))
-    prev_sel = st.session_state.get('vor_selected_rows', set())
-    display_vor['Select'] = display_vor['Idx'].apply(lambda i: i in prev_sel)
-    edited = st.data_editor(
-        display_vor,
-        use_container_width=True,
-        hide_index=True,
-        disabled={
-            'Latitude': True,
-            'Longitude': True,
-            'Avg Conflict': True,
-            'Max Conflict': True,
-            'Freq': True,
-            'Avg Dist (m)': True,
-            'Idx': True,
-        },
-        num_rows="fixed",
-        key="voronoi_editor",
-    )
-    current_sel = set(edited.loc[edited['Select'] == True, 'Idx'].astype(int).tolist())
-    st.session_state['vor_selected_rows'] = current_sel
-    col_run, col_results = st.columns([1,4])
-    with col_run:
-        if st.button("Simulate selected"):
-            if not current_sel:
-                st.warning("Select at least one candidate to simulate.")
-            else:
-                params = st.session_state.get('sim_params', {})
-                w_worst = params.get('w_worst', 0.30)
-                w_avg = params.get('w_avg', 0.05)
-                w_cov = params.get('w_cov', 0.05)
-                w_neigh = params.get('w_neigh', 0.60)
-                interference_radius = params.get('interference_radius', 50)
-                cca_increase = params.get('cca_increase', 0.15)
-                cfg = SimulationConfig(
-                    interference_radius_m=interference_radius,
-                    cca_increase_factor=cca_increase,
-                    indoor_only=True,
-                    conflictivity_threshold_placement=params.get('threshold', 0.6),
-                    snapshots_per_profile=params.get('snapshots', 5),
-                    target_stress_profile=None,
-                    weight_worst_ap=w_worst,
-                    weight_average=w_avg,
-                    weight_coverage=w_cov,
-                    weight_neighborhood=w_neigh,
-                )
-                scorer = CompositeScorer(
-                    weight_worst_ap=w_worst,
-                    weight_average=w_avg,
-                    weight_coverage=w_cov,
-                    weight_neighborhood=w_neigh,
-                    neighborhood_mode=NeighborhoodOptimizationMode.BALANCED,
-                    interference_radius_m=interference_radius,
-                )
-                batch_results = []
-                combined_points = []
-                progress = st.progress(0.0)
-                for b_i, idx in enumerate(sorted(current_sel)):
-                    row = vor_df.iloc[idx]
-                    single_results = []
-                    combined_points.append({'lat': float(row['lat']), 'lon': float(row['lon']), 'label': f"AP-VOR-{idx+1}"})
-                    for (profile, snap_path, snap_dt) in st.session_state.get('voronoi_scenarios', []):
-                        df_snap = read_ap_snapshot(snap_path, band_mode='worst').merge(geo_df, on='name', how='inner')
-                        df_snap = df_snap[df_snap['group_code'] != 'SAB'].copy()
-                        if df_snap.empty:
-                            continue
-                        _, new_ap_stats, metrics = simulate_ap_addition(
-                            df_snap,
-                            float(row['lat']),
-                            float(row['lon']),
-                            cfg,
-                            scorer,
-                        )
-                        metrics['stress_profile'] = profile.value
-                        metrics['timestamp'] = snap_dt
-                        single_results.append(metrics)
-                    if single_results:
-                        agg = aggregate_scenario_results(float(row['lat']), float(row['lon']), float(row.get('avg_conflictivity', 0.0)), single_results)
-                        agg['label'] = f"AP-VOR-{idx+1}"
-                        batch_results.append(agg)
-                    progress.progress((b_i+1)/max(1,len(current_sel)))
-                progress.empty()
-                if batch_results:
-                    res_df = pd.DataFrame(batch_results)
-                    res_df = res_df.sort_values('final_score', ascending=False)
-                    st.session_state['batch_vor_results'] = res_df
-                    # Update main map with combined simulation of selected APs on latest snapshot
-                    try:
-                        base_latest = read_ap_snapshot(selected_path, band_mode='worst').merge(geo_df, on='name', how='inner')
-                        base_latest = base_latest[base_latest['group_code'] != 'SAB'].copy()
-                        if not base_latest.empty:
-                            cfg_multi = SimulationConfig(
-                                interference_radius_m=interference_radius,
-                                cca_increase_factor=cca_increase,
-                                indoor_only=True,
-                                conflictivity_threshold_placement=params.get('threshold', 0.6),
-                                snapshots_per_profile=params.get('snapshots', 5),
-                                target_stress_profile=None,
-                                weight_worst_ap=w_worst,
-                                weight_average=w_avg,
-                                weight_coverage=w_cov,
-                                weight_neighborhood=w_neigh,
-                            )
-                            df_after_multi = simulate_multiple_ap_additions(base_latest, combined_points, cfg_multi)
-                            st.session_state['map_override_df'] = df_after_multi
-                            st.session_state['new_node_markers'] = combined_points
-                            st.success("Simulated Map rendered below with sky blue NEW AP markers.")
-                            # Trigger a second rerun so the top section can render the Simulated Map
-                            st.rerun()
-                    except Exception as e:
-                        st.warning(f"Combined map update failed: {e}")
-    with col_results:
-        if 'batch_vor_results' in st.session_state:
-            res_df = st.session_state['batch_vor_results']
-            show_cols = [c for c in ['label','lat','lon','final_score','score_std','avg_reduction_raw_mean','worst_ap_improvement_raw_mean','new_ap_client_count_mean','n_scenarios'] if c in res_df.columns]
-            st.subheader("📊 Batch Simulation Results")
-            st.dataframe(
-                res_df[show_cols].style.format({
-                    'lat':'{:.6f}','lon':'{:.6f}','final_score':'{:.3f}','score_std':'{:.3f}','avg_reduction_raw_mean':'{:.3f}','worst_ap_improvement_raw_mean':'{:.3f}','new_ap_client_count_mean':'{:.0f}','n_scenarios':'{:.0f}'
-                }),
-                use_container_width=True
-            )
 
 # Run simulation if enabled
 if run_simulation and st.session_state.get('run_sim', False):
@@ -1770,9 +1200,6 @@ if run_simulation and st.session_state.get('run_sim', False):
     w_avg = params.get('w_avg', 0.30)
     w_cov = params.get('w_cov', 0.20)
     w_neigh = params.get('w_neigh', 0.20)
-    sim_interior_buffer_tiles = params.get('interior_buffer_tiles', 2)
-    sim_inner_clearance_m = params.get('inner_clearance_m', 10)
-    use_voronoi_candidates = params.get('use_voronoi_candidates', False)
     
     with st.spinner("🔍 Running multi-scenario AP placement simulation..."):
         try:
@@ -1861,29 +1288,13 @@ if run_simulation and st.session_state.get('run_sim', False):
             
             st.info(f"📍 Generating candidate locations (tile_size={TILE_M_FIXED}m, threshold={sim_threshold})...")
             
-            if use_voronoi_candidates:
-                # Build scenario list from all_scenarios for Voronoi aggregation
-                candidates = generate_voronoi_candidates(
-                    all_scenarios,
-                    geo_df=geo_df,
-                    radius_m=radius_m,
-                    conflictivity_threshold=sim_threshold,
-                    tile_radius_clearance_m=sim_inner_clearance_m,
-                    merge_radius_m=8.0,
-                    max_vertices_per_scenario=60,
-                )
-                if not candidates.empty:
-                    st.info(f"🧩 Voronoi mode: grouped {len(candidates)} vertex clusters (sorted by frequency,avg conflictivity)")
-            else:
-                candidates = generate_candidate_locations(
-                    df_first,
-                    tile_meters=TILE_M_FIXED,
-                    conflictivity_threshold=sim_threshold,
-                    radius_m=radius_m,
-                    indoor_only=config.indoor_only,
-                    neighbor_radius_tiles=sim_interior_buffer_tiles,
-                    inner_clearance_m=sim_inner_clearance_m,
-                )
+            candidates = generate_candidate_locations(
+                df_first,
+                tile_meters=TILE_M_FIXED,
+                conflictivity_threshold=sim_threshold,
+                radius_m=radius_m,
+                indoor_only=config.indoor_only,
+            )
             
             if candidates.empty:
                 st.warning(f"⚠️ No candidates found with conflictivity > {sim_threshold}")
@@ -2099,35 +1510,7 @@ if run_simulation and st.session_state.get('run_sim', False):
     # Reset simulation flag
     st.session_state.run_sim = False
 
-if 'map_rendered' not in locals():
-    st.plotly_chart(fig, use_container_width=True)
-    # Render a second map with the simulated surface, if available
-    if 'map_override_df' in st.session_state and st.session_state['map_override_df'] is not None:
-        sim_df = st.session_state['map_override_df']
-        fig_sim = create_dual_interpolated_map(
-            df=sim_df,
-            center_lat=center_lat,
-            center_lon=center_lon,
-            show_uab=show_uab,
-            show_sab=show_sab,
-            zoom=15,
-            tile_meters=TILE_M_FIXED,
-            max_tiles=MAX_TILES_NO_LIMIT,
-            radius_m=radius_m,
-        )
-        if 'new_node_markers' in st.session_state and st.session_state['new_node_markers']:
-            nn = st.session_state['new_node_markers']
-            fig_sim.add_trace(go.Scattermapbox(
-                lat=[p['lat'] for p in nn],
-                lon=[p['lon'] for p in nn],
-                mode='markers+text',
-                marker=dict(size=10, color='skyblue', opacity=0.95),
-                text=[p.get('label', 'AP-NEW') for p in nn],
-                textposition='top center',
-                name='New APs (simulated)',
-            ))
-        st.subheader("Simulated Map")
-        st.plotly_chart(fig_sim, use_container_width=True)
+st.plotly_chart(fig, use_container_width=True)
 
 # Footer
 st.caption(

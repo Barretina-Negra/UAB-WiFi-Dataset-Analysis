@@ -1,5 +1,5 @@
 """
-Enhanced Conflictivity Dashboard with Time Series Navigation
+Aina AI Enhanced Conflictivity Dashboard with Time Series Navigation
 
 Purpose
 - Show a heatmap of Wi-Fi conflictivity by AP on the UAB campus with time series navigation.
@@ -47,6 +47,12 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import requests
+from dotenv import load_dotenv
+import os
+
+# Load environment variables
+load_dotenv()
 
 # -------- Paths --------
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -331,6 +337,7 @@ def create_optimized_heatmap(
     location_groups = location_groups.sort_values("max_conflictivity", ascending=True)
 
     hover_texts = []
+    ap_names_list = []  # Store AP names for selection
     for _, row in location_groups.iterrows():
         ap_data = sorted(
             zip(
@@ -349,8 +356,10 @@ def create_optimized_heatmap(
                 t += f"<br>Clients: {int(cli)}"
             if util is not None and not np.isnan(util):
                 t += f"<br>Radio Util: {util:.1f}%"
+            ap_names_list.append([n])  # Single AP
         else:
             t = f"<b>{len(ap_data)} APs at this location</b><br><br>"
+            names_at_location = []
             for i, (n, conf, cli, util) in enumerate(ap_data):
                 t += f"<b>{n}</b><br>  Conflictivity: {conf:.3f}"
                 if cli is not None:
@@ -359,6 +368,8 @@ def create_optimized_heatmap(
                     t += f" | Radio: {util:.1f}%"
                 if i < len(ap_data) - 1:
                     t += "<br>"
+                names_at_location.append(n)
+            ap_names_list.append(names_at_location)  # Multiple APs
         hover_texts.append(t)
 
     fig = go.Figure(
@@ -391,6 +402,7 @@ def create_optimized_heatmap(
             text=hover_texts,
             hovertemplate="%{text}<extra></extra>",
             showlegend=False,
+            customdata=ap_names_list,  # Store AP names for selection
         )
     )
 
@@ -494,7 +506,259 @@ fig = create_optimized_heatmap(
     radius=radius,
     zoom=15,
 )
-st.plotly_chart(fig, use_container_width=True)
+
+# Initialize session state for chart key (to force refresh and clear selection)
+if "chart_refresh_key" not in st.session_state:
+    st.session_state.chart_refresh_key = 0
+
+# Function to refresh chart when dialog closes
+def on_dialog_close():
+    # Increment key to force chart recreation and clear selection
+    st.session_state.chart_refresh_key += 1
+
+# Dialog function for AINA AI analysis
+@st.dialog("🤖 Anàlisi AINA AI", on_dismiss=on_dialog_close)
+def show_aina_analysis(ap_name: str, ap_row: pd.Series):
+    """Show AINA AI analysis in a modal dialog."""
+    st.subheader(f"Access Point: {ap_name}")
+    
+    # Prepare AP data for AI
+    util_2g = ap_row.get("util_2g", np.nan)
+    util_5g = ap_row.get("util_5g", np.nan)
+    client_count = ap_row.get("client_count", 0)
+    cpu_util = ap_row.get("cpu_utilization", np.nan)
+    mem_free = ap_row.get("mem_free", np.nan)
+    mem_total = ap_row.get("mem_total", np.nan)
+    mem_used_pct = ap_row.get("mem_used_pct", np.nan)
+    conflictivity = ap_row.get("conflictivity", np.nan)
+    
+    # Format AP data for AI (handle NaN values)
+    def format_value(val, format_str="{:.1f}", default="no disponible"):
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            return default
+        return format_str.format(val)
+    
+    # Show AP info
+    with st.expander("📊 Dades de l'Access Point", expanded=False):
+        st.write(f"- **Nom:** {ap_name}")
+        st.write(f"- **Utilització màxima 2.4 GHz:** {format_value(util_2g, '{:.1f}%', 'no disponible')}")
+        st.write(f"- **Utilització màxima 5 GHz:** {format_value(util_5g, '{:.1f}%', 'no disponible')}")
+        st.write(f"- **Nombre de clients connectats:** {int(client_count) if not (isinstance(client_count, float) and np.isnan(client_count)) else 0}")
+        st.write(f"- **Utilització CPU:** {format_value(cpu_util, '{:.1f}%', 'no disponible')}")
+        st.write(f"- **Memòria lliure:** {format_value(mem_free, '{:.0f} MB', 'no disponible')}")
+        st.write(f"- **Memòria total:** {format_value(mem_total, '{:.0f} MB', 'no disponible')}")
+        st.write(f"- **Percentatge de memòria usada:** {format_value(mem_used_pct, '{:.1f}%', 'no disponible')}")
+        st.write(f"- **Puntuació de conflictivitat calculada:** {format_value(conflictivity, '{:.3f}', 'no disponible')}")
+    
+    ap_info_text = f"""Dades de l'Access Point:
+
+- Nom: {ap_name}
+- Utilització màxima 2.4 GHz: {format_value(util_2g, '{:.1f}%', 'no disponible')}
+- Utilització màxima 5 GHz: {format_value(util_5g, '{:.1f}%', 'no disponible')}
+- Nombre de clients connectats: {int(client_count) if not (isinstance(client_count, float) and np.isnan(client_count)) else 0}
+- Utilització CPU: {format_value(cpu_util, '{:.1f}%', 'no disponible')}
+- Memòria lliure: {format_value(mem_free, '{:.0f} MB', 'no disponible')}
+- Memòria total: {format_value(mem_total, '{:.0f} MB', 'no disponible')}
+- Percentatge de memòria usada: {format_value(mem_used_pct, '{:.1f}%', 'no disponible')}
+- Puntuació de conflictivitat calculada: {format_value(conflictivity, '{:.3f}', 'no disponible')}
+
+"""
+    
+    # AINA AI API call
+    API_KEY = os.getenv("AINA_API_KEY")
+    if not API_KEY:
+        st.error("❌ AINA_API_KEY no trobada a les variables d'entorn. Si us plau, crea un fitxer .env amb AINA_API_KEY=tu_api_key")
+        return
+    
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+        "User-Agent": "UAB-THE-HACK/1.0"
+    }
+    
+    prompt = ap_info_text + """Aquest Access Point es conflictiu, investiga les causes tenint en compte que aquests son els criteris que s'utilitza per calcular conflictivitat:
+
+Aquí tens el nou model de conflictivitat, pas a pas.
+
+Entrades per AP
+
+- util_2g, util_5g: utilització màxima del canal per banda (de radios[].utilization)
+
+- client_count
+
+- cpu_utilization (%)
+
+- mem_used_pct = 100 x (1 - mem_free/mem_total)
+
+1) Malestar d'aire (airtime) per banda
+
+- Mapar la utilització a una puntuació de malestar no lineal en [0,1], més estricta a 2,4 GHz.
+
+2,4 GHz (band="2g")
+
+- 0-10% → 0-0,05
+
+- 10-25% → 0,05-0,40
+
+- 25-50% → 0,40-0,75
+
+- 50-100% → 0,75-1,00
+
+5 GHz (band="5g")
+
+- 0-15% → 0-0,05
+
+- 15-35% → 0,05-0,40
+
+- 35-65% → 0,40-0,75
+
+- 65-100% → 0,75-1,00
+
+2) Agregació de l'airtime entre bandes
+
+- band_mode="worst" (per defecte): airtime_score = max(airtime_2g, airtime_5g)
+
+- band_mode="avg": mitjana ponderada (2,4 GHz 0,6, 5 GHz 0,4)
+
+- band_mode="2.4GHz"/"5GHz": prendre la puntuació d'aquesta banda
+
+3) Alleujament quan no hi ha clients
+
+- Si client_count == 0, reduir airtime_score un 20% per distingir soroll veí de contenció:
+
+  airtime_score_adj = airtime_score x 0,8
+
+- Altrament airtime_score_adj = airtime_score
+
+4) Pressió de clients
+
+- Relativa a la instantània, amb escala logarítmica:
+
+  client_score = log1p(client_count) / log1p(p95_clients)
+
+  on p95_clients és el percentil 95 de clients entre els APs a la instantània seleccionada.
+
+  El resultat es limita a [0,1].
+
+5) Salut de recursos de l'AP
+
+- CPU:
+
+  - ≤70% → 0
+
+  - 70-90% → lineal fins a 0,6
+
+  - 90-100% → lineal fins a 1,0
+
+- Memòria (percentatge usat):
+
+  - ≤80% → 0
+
+  - 80-95% → lineal fins a 0,6
+
+  - 95-100% → lineal fins a 1,0
+
+6) Combinació en conflictivitat
+
+- Omplir airtime_score absent amb 0,4 (neutral-ish) per evitar recompensar dades absents.
+
+- Suma ponderada (retallada a [0,1]):
+
+  conflictivity =
+
+    0,75 x airtime_score_filled +
+
+    0,15 x client_score +
+
+    0,05 x cpu_score +
+
+    0,05 x mem_score
+
+Intuïció
+
+- L'airtime (canal ocupat/qualitat) predomina.
+
+- La pressió puja amb més clients però desacelera a compts baixos (escala log).
+
+- CPU/memòria només importen quan realment estan estressats.
+
+- Es penalitza abans la banda de 2,4 GHz perquè es degrada abans.
+
+- Si un canal està ocupat però no tens clients, encara importa, però una mica menys.
+
+Ara vull que em raonis si l'AP es conflictiu per saturació d'ampla de banda ocupat (a partir de la `radio[].utilization`), per AP saturat (amb massa clients) o per ambdós.
+
+L'AP està dissenyat per gestionar un màxim de 50 clients concurrents. Està massa carregat si s'apropa a supera aquest nombre.
+
+La utilització de banda comença a afectar a partir de 40% de utilització.
+
+Si n'hi ha un numero alt d'ambos, doncs clarament el raonament es ambdos. Pero 20-30 clients un AP pot gestionar facilment.
+"""
+    
+    # Show loading state and call AINA AI
+    with st.spinner("🔄 Esperant resposta d'AINA..."):
+        payload = {
+            "model": "BSC-LT/ALIA-40b-instruct_Q8_0",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1000,
+            "temperature": 0.7,
+        }
+        
+        try:
+            response = requests.post(
+                "https://api.publicai.co/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                resposta = data["choices"][0]["message"]["content"]
+                st.success("**Resposta d'AINA:**")
+                st.markdown(resposta)
+            else:
+                st.error(f"❌ Error {response.status_code}: {response.text}")
+        except Exception as e:
+            st.error(f"❌ Error en la petició: {str(e)}")
+
+# Handle map selection - make points selectable
+fig.update_layout(clickmode='event+select')
+# Use chart_refresh_key to force recreation when dialog closes (clears selection)
+selected_points = st.plotly_chart(
+    fig, 
+    use_container_width=True, 
+    on_select="rerun",
+    key=f"ap_map_{st.session_state.chart_refresh_key}"
+)
+
+# Process selection and open dialog
+if selected_points and "selection" in selected_points:
+    selection = selected_points["selection"]
+    if "points" in selection and len(selection["points"]) > 0:
+        # Get the first selected point
+        point = selection["points"][0]
+        ap_name = None
+        
+        # Try to get AP name from customdata first
+        if "customdata" in point and point["customdata"]:
+            ap_names = point["customdata"]
+            if isinstance(ap_names, list) and len(ap_names) > 0:
+                # customdata is always a list: [ap_name] for single AP or [ap1, ap2, ...] for multiple
+                ap_name = ap_names[0] if isinstance(ap_names[0], str) else str(ap_names[0])
+        
+        # Fallback: try to extract from text/hover if customdata didn't work
+        if not ap_name and "text" in point:
+            text = point["text"]
+            name_match = re.search(r"<b>([^<]+)</b>", text)
+            if name_match:
+                ap_name = name_match.group(1)
+        
+        if ap_name:
+            # Find AP data and open dialog
+            ap_data = merged[merged["name"] == ap_name]
+            if not ap_data.empty:
+                show_aina_analysis(ap_name, ap_data.iloc[0])
 
 # Top list
 st.subheader("Top conflictive Access Points")
@@ -530,5 +794,6 @@ band_info = {
 st.caption(
     f"📻 Band mode: {band_info[band_mode]}  |  "
     "💡 Conflictivity measures Wi-Fi stress by combining channel congestion (75%), number of connected devices (15%), and AP resource usage (10%)  |  "
-    "🟢 Low ↔ 🔴 High (0–1)"
+    "🟢 Low ↔ 🔴 High (0–1)  |  "
+    "👆 Selecciona un AP al mapa per analitzar-lo amb AINA AI"
 )

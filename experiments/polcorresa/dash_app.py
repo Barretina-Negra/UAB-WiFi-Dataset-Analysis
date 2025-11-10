@@ -9,7 +9,7 @@ import plotly.express as px
 from dash import Dash, dcc, html, Input, Output, State
 
 # ---------- Paths ----------
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
 AP_DIR = os.path.join(ROOT, 'realData', 'ap')
 GEOJSON_PATH = os.path.join(ROOT, 'realData', 'geoloc', 'aps_geolocalizados_wgs84.geojson')
 

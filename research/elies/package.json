@@ -1,0 +1,17 @@
+{
+  "name": "uab-wifi-analysis",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "TypeScript scripts for analyzing UAB WiFi dataset",
+  "scripts": {
+    "count:aps": "bun run count_unique_aps.ts",
+    "count:modes": "bun run count_ap_deployment_modes.ts",
+    "analyze:clients": "bun run analyze_client_timeslots.ts",
+    "analyze:conflictivity": "bun run conflictivity_analyzer.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}
+
