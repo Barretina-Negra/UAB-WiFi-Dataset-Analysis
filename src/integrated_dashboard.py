@@ -54,10 +54,10 @@ sys.path.insert(0, str(REPO_ROOT))
 
 # Import simulator components (try-except for graceful degradation)
 try:
-    from simulator.config import SimulationConfig, StressLevel
-    from simulator.stress_profiler import StressProfiler
-    from simulator.scoring import CompositeScorer, NeighborhoodOptimizationMode
-    from simulator.spatial import haversine_m as sim_haversine_m
+    from experiments.polcorresa.simulator.config import SimulationConfig, StressLevel
+    from experiments.polcorresa.simulator.stress_profiler import StressProfiler
+    from experiments.polcorresa.simulator.scoring import CompositeScorer, NeighborhoodOptimizationMode
+    from experiments.polcorresa.simulator.spatial import haversine_m as sim_haversine_m
     SIMULATOR_AVAILABLE = True
 except ImportError:
     SIMULATOR_AVAILABLE = False
