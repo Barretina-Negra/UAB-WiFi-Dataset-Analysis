@@ -152,7 +152,6 @@ test-results/
 
 # Ignore the data samples used in the analysis notebooks
 realData/
-reducedData/
 
 .venv311/
 
