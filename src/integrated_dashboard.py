@@ -46,8 +46,8 @@ load_dotenv()
 
 # -------- Paths --------
 REPO_ROOT = Path(__file__).resolve().parents[1]
-AP_DIR = REPO_ROOT / "realData" / "ap"
-GEOJSON_PATH = REPO_ROOT / "realData" / "geoloc" / "aps_geolocalizados_wgs84.geojson"
+AP_DIR = REPO_ROOT / "reducedData" / "ap"
+GEOJSON_PATH = REPO_ROOT / "reducedData" / "geoloc" / "aps_geolocalizados_wgs84.geojson"
 
 # Add simulator to path
 sys.path.insert(0, str(REPO_ROOT))
