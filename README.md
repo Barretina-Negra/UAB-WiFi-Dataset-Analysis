@@ -61,7 +61,11 @@ uv sync
 source .venv/bin/activate  # On Windows: .\.venv\Scripts\activate
 ```
 
-Need optional tooling? Add `--group ml`, `--group llm`, etc. to pull in the extras defined in `pyproject.toml`.
+Working inside the research notebooks? Pull in the extra tooling with:
+```bash
+uv sync --group notebooks
+```
+This brings in Jupyter, ipykernel/ipywidgets, and notebook-only libs such as NetworkX.
 
 ### Environment Setup
 Create a `.env` file in the project root:
