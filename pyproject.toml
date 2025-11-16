@@ -10,6 +10,7 @@ authors = [
 dependencies = [
   "pandas>=2.1.0",
   "numpy>=1.24.0",
+  "scipy>=1.11.0",
   "tqdm>=4.66.0",
   "matplotlib>=3.8.0",
   "seaborn>=0.13.0",
