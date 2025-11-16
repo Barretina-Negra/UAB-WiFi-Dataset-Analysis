@@ -21,14 +21,21 @@ Run
 
 from __future__ import annotations
 
-import json
 import math
 import re
 import sys
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from datetime import datetime
-from collections import defaultdict, Counter
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+)
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -37,79 +44,177 @@ import streamlit as st
 import requests
 from dotenv import load_dotenv
 import os
-from shapely.geometry import Point, MultiPoint, LineString, Polygon
+from shapely.geometry import Point, LineString, Polygon
 from shapely.ops import unary_union, linemerge, snap
 from matplotlib.path import Path as MplPath
+
+# Import shared types and constants (only used ones)
+from dashboard.types import (
+    JOIN_M_DEFAULT,
+    MAX_TILES_NO_LIMIT,
+    SNAP_M_DEFAULT,
+    TILE_M_FIXED,
+    VOR_TOL_M_FIXED,
+    W_AIR,
+    W_CL,
+    W_CPU,
+    W_MEM,
+)
+
+SRC_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = SRC_ROOT.parent
+
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # Load environment variables
 load_dotenv()
 
-# -------- Paths --------
-REPO_ROOT = Path(__file__).resolve().parents[1]
-AP_DIR = REPO_ROOT / "reducedData" / "ap"
-GEOJSON_PATH = REPO_ROOT / "reducedData" / "geoloc" / "aps_geolocalizados_wgs84.geojson"
+from dashboard.data_io import (
+    AP_DIR,
+    GEOJSON_PATH,
+    extract_group,
+    find_snapshot_files,
+    read_ap_snapshot as load_ap_snapshot,
+    read_geoloc_points,
+)
 
-# Add simulator to path
-sys.path.insert(0, str(REPO_ROOT))
+if TYPE_CHECKING:
+    pass
+else:
+    SimulationConfigType = Any
+    StressLevelType = Enum
+    CompositeScorerType = Any
+    NeighborhoodOptimizationModeType = Enum
+    StressProfilerType = Any
 
 # Import simulator components (try-except for graceful degradation)
+simulator_available: bool = False
 try:
-    from experiments.polcorresa.simulator.config import SimulationConfig, StressLevel
+    from experiments.polcorresa.simulator.config import SimulationConfig
+    from experiments.polcorresa.simulator.config import StressLevel
     from experiments.polcorresa.simulator.stress_profiler import StressProfiler
     from experiments.polcorresa.simulator.scoring import CompositeScorer, NeighborhoodOptimizationMode
-    from experiments.polcorresa.simulator.spatial import haversine_m as sim_haversine_m
-    SIMULATOR_AVAILABLE = True
+    simulator_available = True
 except ImportError:
-    SIMULATOR_AVAILABLE = False
+    simulator_available = False
+
+    class _FallbackStressLevel(Enum):
+        LOW = "low"
+        MEDIUM = "medium"
+        HIGH = "high"
+        CRITICAL = "critical"
+
+        def __str__(self) -> str:
+            return self.value
+
+    @dataclass
+    class _FallbackSimulationConfig:
+        reference_distance_m: float = 1.0
+        path_loss_exponent: float = 3.5
+        reference_rssi_dbm: float = -40.0
+        min_rssi_dbm: float = -85.0
+        max_offload_fraction: float = 0.25
+        sticky_client_fraction: float = 0.15
+        max_clients_per_ap: int = 35
+        target_util_2g: float = 35.0
+        target_util_5g: float = 25.0
+        interference_radius_m: float = 50.0
+        cca_increase_factor: float = 0.15
+        indoor_only: bool = True
+        conflictivity_threshold_placement: float = 0.6
+        snapshots_per_profile: int = 5
+        target_stress_profile: Optional[_FallbackStressLevel] = _FallbackStressLevel.HIGH
+        weight_worst_ap: float = 0.30
+        weight_average: float = 0.30
+        weight_coverage: float = 0.20
+        weight_neighborhood: float = 0.20
+        utilization_threshold_critical: float = 70.0
+        utilization_threshold_high: float = 50.0
+
+        def get_weights_dict(self) -> dict[str, float]:
+            return {
+                "worst_ap": self.weight_worst_ap,
+                "average": self.weight_average,
+                "coverage": self.weight_coverage,
+                "neighborhood": self.weight_neighborhood,
+            }
+
+    class _UnavailableComponent:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise RuntimeError(
+                "Simulator components are unavailable. Install simulator dependencies to enable this feature."
+            )
+
+        def __call__(self, *args: object, **kwargs: object) -> None:
+            raise RuntimeError(
+                "Simulator components are unavailable. Install simulator dependencies to enable this feature."
+            )
+
+        def get_representative_snapshots(self, *args: object, **kwargs: object) -> list[Path]:
+            raise RuntimeError(
+                "Simulator components are unavailable. Install simulator dependencies to enable this feature."
+            )
+
+        def classify_snapshots(self, *args: object, **kwargs: object) -> Dict[str, Any]:
+            raise RuntimeError(
+                "Simulator components are unavailable. Install simulator dependencies to enable this feature."
+            )
+
+        def get_profile_statistics(self, *args: object, **kwargs: object) -> Dict[str, Any]:
+            raise RuntimeError(
+                "Simulator components are unavailable. Install simulator dependencies to enable this feature."
+            )
+
+    class _FallbackNeighborhoodMode(Enum):
+        BALANCED = "balanced"
+
+    def sim_haversine_m(*args: object, **kwargs: object) -> float:
+        raise RuntimeError("Simulator components are unavailable. Install simulator dependencies to enable this feature.")
+
+    StressLevel = _FallbackStressLevel
+    SimulationConfig = _FallbackSimulationConfig
+    StressProfiler = _UnavailableComponent  # type: ignore[assignment]
+    CompositeScorer = _UnavailableComponent  # type: ignore[assignment]
+    NeighborhoodOptimizationMode = _FallbackNeighborhoodMode
 
 # Check for scipy Voronoi
+has_scipy_voronoi: bool = False
 try:
-    from scipy.spatial import Voronoi
-    _HAS_SCIPY_VORONOI = True
+    from scipy.spatial import Voronoi  # type: ignore[import-not-found]
+    has_scipy_voronoi = True
 except Exception:
-    _HAS_SCIPY_VORONOI = False
-
-# -------- Helpers --------
-def norm01(series: pd.Series, invert: bool = False) -> pd.Series:
-    """Simple min-max, falls back to 0.5 when no variance."""
-    s = series.astype(float)
-    rng = s.max() - s.min()
-    if rng == 0 or np.isinf(rng) or np.isnan(rng):
-        return pd.Series(0.5, index=s.index)
-    n = (s - s.min()) / rng
-    return 1 - n if invert else n
-
-def extract_group(ap_name: Optional[str]) -> Optional[str]:
-    if not isinstance(ap_name, str):
-        return None
-    m = re.match(r"^AP-([A-Za-z]+)", ap_name)
-    return m.group(1) if m else None
-
-def find_snapshot_files(ap_dir: Path) -> List[Tuple[Path, datetime]]:
-    files = list(ap_dir.glob("AP-info-v2-*.json"))
-    files_with_time = []
-    for f in files:
-        m = re.search(r"(\d{4})-(\d{2})-(\d{2})T(\d{2})_(\d{2})_(\d{2})", f.name)
-        if m:
-            y, mo, d, h, mi, s = map(int, m.groups())
-            files_with_time.append((f, datetime(y, mo, d, h, mi, s)))
-    files_with_time.sort(key=lambda x: x[1])
-    return files_with_time
+    has_scipy_voronoi = False
 
 
 def resolve_stress_profiles(
-    target: Optional["StressLevel"],
-    stats: Dict["StressLevel", Dict[str, float]],
-) -> Tuple[List["StressLevel"], Optional["StressLevel"], Optional[str]]:
-    """Pick stress profiles to simulate, falling back gracefully when data is missing."""
-    priority = [StressLevel.CRITICAL, StressLevel.HIGH, StressLevel.MEDIUM, StressLevel.LOW]
-    counts = {lvl: stats.get(lvl, {}).get('count', 0) for lvl in priority}
-    available = [lvl for lvl in priority if counts.get(lvl, 0) > 0]
+    target: Any,  # StressLevel or None
+    stats: Dict[Any, Dict[str, float]],  # Dict[StressLevel, Dict[str, float]]
+) -> Tuple[List[Any], Any, Optional[str]]:  # Returns (List[StressLevel], StressLevel | None, str | None)
+    """Pick stress profiles to simulate, falling back gracefully when data is missing.
+    
+    Args:
+        target: Target stress level (StressLevel enum member or None)
+        stats: Statistics dictionary keyed by StressLevel
+        
+    Returns:
+        Tuple of (profiles_list, effective_target, error_message)
+    """
+    priority: list[Any] = [
+        StressLevel.CRITICAL,  # type: ignore[attr-defined]
+        StressLevel.HIGH,  # type: ignore[attr-defined]
+        StressLevel.MEDIUM,  # type: ignore[attr-defined]
+        StressLevel.LOW  # type: ignore[attr-defined]
+    ]
+    counts: dict[Any, float] = {lvl: stats.get(lvl, {}).get('count', 0) for lvl in priority}
+    available: list[Any] = [lvl for lvl in priority if counts.get(lvl, 0) > 0]
 
     if target is None:
         if not available:
             return [], None, "No snapshots available in any stress profile."
-        effective_target = None if len(available) > 1 else available[0]
+        effective_target: Any = None if len(available) > 1 else available[0]
         return available, effective_target, None
 
     if counts.get(target, 0) > 0:
@@ -168,77 +273,10 @@ def mem_health_score(mem_used_pct: float) -> float:
         return 0.6 * ((m - 80) / 15.0)
     return 0.6 + 0.4 * ((m - 95) / 5.0)
 
-def read_ap_snapshot(path: Path, band_mode: str = "worst") -> pd.DataFrame:
-    """Read AP snapshot and calculate advanced conflictivity."""
-    with path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    rows = []
-    for ap in data:
-        name = ap.get("name")
-        client_count = ap.get("client_count", 0)
-        cpu_util = ap.get("cpu_utilization", 0)
-        mem_free = ap.get("mem_free", 0)
-        mem_total = ap.get("mem_total", 0)
-        group_name = ap.get("group_name")
-        site = ap.get("site")
-        radios = ap.get("radios") or []
-
-        util_2g = []
-        util_5g = []
-        for r in radios:
-            u = r.get("utilization")
-            band = r.get("band")
-            if u is None:
-                continue
-            if band == 0:
-                util_2g.append(float(u))
-            elif band == 1:
-                util_5g.append(float(u))
-
-        max_2g = max(util_2g) if util_2g else np.nan
-        max_5g = max(util_5g) if util_5g else np.nan
-
-        if band_mode == "2.4GHz":
-            agg_util = max_2g
-        elif band_mode == "5GHz":
-            agg_util = max_5g
-        elif band_mode == "avg":
-            parts = [x for x in [max_2g, max_5g] if not np.isnan(x)]
-            agg_util = float(np.mean(parts)) if parts else np.nan
-        else:  # "worst"
-            agg_util = np.nanmax([max_2g, max_5g])
-
-        rows.append(
-            {
-                "name": name,
-                "group_name": group_name,
-                "site": site,
-                "client_count": pd.to_numeric(client_count, errors="coerce"),
-                "cpu_utilization": pd.to_numeric(cpu_util, errors="coerce"),
-                "mem_free": pd.to_numeric(mem_free, errors="coerce"),
-                "mem_total": pd.to_numeric(mem_total, errors="coerce"),
-                "util_2g": max_2g,
-                "util_5g": max_5g,
-                "agg_util": agg_util,
-            }
-        )
-
-    df = pd.DataFrame(rows)
-
-    # Sanitize numerics
-    for c in ["client_count", "cpu_utilization", "mem_free", "mem_total", "util_2g", "util_5g", "agg_util"]:
-        if c in df:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    # Memory used %
-    df["mem_used_pct"] = (1 - (df["mem_free"] / df["mem_total"])).clip(0, 1) * 100
-    df["mem_used_pct"] = df["mem_used_pct"].fillna(0)
-
+def _enrich_conflictivity_metrics(df: pd.DataFrame, band_mode: str, p95_clients: float) -> pd.DataFrame:
     w_2g = 0.6
     w_5g = 0.4
 
-    # Airtime scores per band
     df["air_s_2g"] = df["util_2g"].apply(lambda u: airtime_score(u, "2g") if not np.isnan(u) else np.nan)
     df["air_s_5g"] = df["util_5g"].apply(lambda u: airtime_score(u, "5g") if not np.isnan(u) else np.nan)
 
@@ -251,15 +289,13 @@ def read_ap_snapshot(path: Path, band_mode: str = "worst") -> pd.DataFrame:
             (df["air_s_2g"].fillna(0) * w_2g + df["air_s_5g"].fillna(0) * w_5g)
             / ((~df["air_s_2g"].isna()) * w_2g + (~df["air_s_5g"].isna()) * w_5g).replace(0, np.nan)
         )
-    else:  # worst
-        df["airtime_score"] = np.nanmax(np.vstack([df["air_s_2g"].fillna(-1), df["air_s_5g"].fillna(-1)]), axis=0)
+    else:
+        df["airtime_score"] = np.nanmax(
+            np.vstack([df["air_s_2g"].fillna(-1), df["air_s_5g"].fillna(-1)]), axis=0
+        )
         df["airtime_score"] = df["airtime_score"].where(df["airtime_score"] >= 0, np.nan)
 
-    # Client pressure normalized to snapshot 95th percentile
-    p95_clients = float(np.nanpercentile(df["client_count"].fillna(0), 95)) if len(df) else 1.0
     df["client_score"] = df["client_count"].apply(lambda n: client_pressure_score(n, p95_clients))
-
-    # Resource health
     df["cpu_score"] = df["cpu_utilization"].apply(cpu_health_score)
     df["mem_score"] = df["mem_used_pct"].apply(mem_health_score)
 
@@ -274,12 +310,6 @@ def read_ap_snapshot(path: Path, band_mode: str = "worst") -> pd.DataFrame:
         relief(a, c) for a, c in zip(df["airtime_score"], df["client_count"])
     ]
 
-    # Final conflictivity weights
-    W_AIR = 0.75
-    W_CL  = 0.15
-    W_CPU = 0.05
-    W_MEM = 0.05
-
     df["airtime_score_filled"] = df["airtime_score_adj"].fillna(0.4)
 
     df["conflictivity"] = (
@@ -293,450 +323,46 @@ def read_ap_snapshot(path: Path, band_mode: str = "worst") -> pd.DataFrame:
     df["group_code"] = df["name"].apply(extract_group)
     return df
 
-def read_geoloc_points(geojson_path: Path) -> pd.DataFrame:
-    with geojson_path.open("r", encoding="utf-8") as f:
-        gj = json.load(f)
-    feats = gj.get("features", [])
-    rows = []
-    for ft in feats:
-        props = (ft or {}).get("properties", {})
-        geom = (ft or {}).get("geometry", {})
-        if (geom or {}).get("type") != "Point":
-            continue
-        coords = geom.get("coordinates") or []
-        if len(coords) < 2:
-            continue
-        name = props.get("USER_NOM_A")
-        if not name:
-            continue
-        lon, lat = float(coords[0]), float(coords[1])
-        rows.append({"name": name, "lon": lon, "lat": lat})
-    return pd.DataFrame(rows)
 
-# ======== AI HEATMAP MODE FUNCTIONS (from aina_dashboard.py) ========
+def read_ap_snapshot(path: Path, band_mode: str = "worst") -> pd.DataFrame:
+    base_df = load_ap_snapshot(path, band_mode)
+    p95_clients = float(np.nanpercentile(base_df["client_count"].fillna(0), 95)) if len(base_df) else 1.0
+    return _enrich_conflictivity_metrics(base_df, band_mode, p95_clients)
 
-def create_optimized_heatmap(
-    df: pd.DataFrame,
-    center_lat: float,
-    center_lon: float,
-    min_conflictivity: float = 0.0,
-    radius: int = 15,
-    zoom: int = 15,
-) -> go.Figure:
-    """Create heatmap with clickable AP points."""
-    df_with_location = df.copy()
-    df_with_location["location_key"] = (
-        df_with_location["lat"].round(6).astype(str)
-        + ","
-        + df_with_location["lon"].round(6).astype(str)
-    )
 
-    location_groups = df_with_location.groupby("location_key").agg(
-        lat=("lat", "first"),
-        lon=("lon", "first"),
-        name=("name", lambda x: list(x)),
-        conflictivity=("conflictivity", lambda x: list(x)),
-        client_count=("client_count", lambda x: list(x) if "client_count" in df.columns else None),
-        max_radio_util=("max_radio_util", lambda x: list(x) if "max_radio_util" in df.columns else None),
-    ).reset_index()
+# ======== DASHBOARD MODE MODULES ========
+# Import modular dashboard components
+from dashboard.ai_heatmap import (
+    create_optimized_heatmap,
+    HeatmapConfig,
+)
 
-    location_groups["max_conflictivity"] = location_groups["conflictivity"].apply(max)
-    location_groups["ap_count"] = location_groups["name"].apply(len)
-    
-    location_groups = location_groups[location_groups["max_conflictivity"] >= min_conflictivity]
-    location_groups = location_groups.sort_values("max_conflictivity", ascending=True)
 
-    hover_texts = []
-    ap_names_list = []
-    for _, row in location_groups.iterrows():
-        ap_data = sorted(
-            zip(
-                row["name"],
-                row["conflictivity"],
-                (row["client_count"] or [None] * len(row["name"])),
-                (row["max_radio_util"] or [None] * len(row["name"])),
-            ),
-            key=lambda x: x[1],
-            reverse=True,
-        )
-        if len(ap_data) == 1:
-            n, conf, cli, util = ap_data[0]
-            t = f"<b>{n}</b><br>Conflictivity: {conf:.3f}"
-            if cli is not None:
-                t += f"<br>Clients: {int(cli)}"
-            if util is not None and not np.isnan(util):
-                t += f"<br>Radio Util: {util:.1f}%"
-            ap_names_list.append([n])
-        else:
-            t = f"<b>{len(ap_data)} APs at this location</b><br><br>"
-            names_at_location = []
-            for i, (n, conf, cli, util) in enumerate(ap_data):
-                t += f"<b>{n}</b><br>  Conflictivity: {conf:.3f}"
-                if cli is not None:
-                    t += f" | Clients: {int(cli)}"
-                if util is not None and not np.isnan(util):
-                    t += f" | Radio: {util:.1f}%"
-                if i < len(ap_data) - 1:
-                    t += "<br>"
-                names_at_location.append(n)
-            ap_names_list.append(names_at_location)
-        hover_texts.append(t)
+# ======== VORONOI MODE FUNCTIONS (from voronoi_viz module) ========
 
-    fig = go.Figure(
-        go.Scattermapbox(
-            lat=location_groups["lat"],
-            lon=location_groups["lon"],
-            mode="markers",
-            marker=dict(
-                size=radius * 2,
-                color=location_groups["max_conflictivity"],
-                colorscale=[
-                    [0.0, "rgb(0, 255, 0)"],
-                    [0.5, "rgb(255, 165, 0)"],
-                    [1.0, "rgb(255, 0, 0)"],
-                ],
-                cmin=0,
-                cmax=1,
-                opacity=0.85,
-                showscale=True,
-                colorbar=dict(
-                    title="Conflictivity",
-                    thickness=15,
-                    len=0.7,
-                    tickmode="linear",
-                    tick0=0,
-                    dtick=0.2,
-                    tickformat=".1f",
-                ),
-            ),
-            text=hover_texts,
-            hovertemplate="%{text}<extra></extra>",
-            showlegend=False,
-            customdata=ap_names_list,
-        )
-    )
+# Import optimized Voronoi functions from dedicated module
+from dashboard.voronoi_viz import (
+    haversine_m as _haversine_m,
+    compute_convex_hull_polygon as _compute_convex_hull_polygon,
+    inverted_weighted_voronoi_edges as _inverted_weighted_voronoi_edges,
+    top_conflictive_voronoi_vertices as _top_conflictive_voronoi_vertices,
+    uab_tiled_choropleth_layer as _uab_tiled_choropleth_layer,
+)
 
-    fig.update_layout(
-        mapbox=dict(
-            style="open-street-map",
-            center=dict(lat=center_lat, lon=center_lon),
-            zoom=zoom,
-        ),
-        margin=dict(l=10, r=10, t=30, b=10),
-        height=700,
-    )
-    return fig
+# ======== SIMULATOR MODE FUNCTIONS (from simulator_viz module) ========
 
-# ======== VORONOI MODE FUNCTIONS (from conflictivity_dashboard_interpolation.py) ========
+# Import simulator functions from dedicated module
+from dashboard.simulator_viz import (
+    simulate_ap_addition,
+    generate_candidate_locations,
+    generate_voronoi_candidates,
+    aggregate_scenario_results,
+    simulate_multiple_ap_additions,
+)
 
-def _compute_convex_hull_polygon(lons: np.ndarray, lats: np.ndarray):
-    """Return a shapely Polygon of the convex hull, or None if degenerate."""
-    pts = [Point(xy) for xy in zip(lons, lats)]
-    if len(pts) < 3:
-        return None
-    mp = MultiPoint(pts)
-    hull = mp.convex_hull
-    if hull.is_empty or hull.geom_type != "Polygon":
-        return None
-    return hull
 
-def _mask_points_in_polygon(lon_grid: np.ndarray, lat_grid: np.ndarray, polygon) -> np.ndarray:
-    """Boolean mask for grid points inside polygon using matplotlib.path.Path."""
-    x, y = polygon.exterior.coords.xy
-    poly_path = MplPath(np.vstack([x, y]).T)
-    XX, YY = np.meshgrid(lon_grid, lat_grid)
-    pts = np.vstack([XX.ravel(), YY.ravel()]).T
-    inside = poly_path.contains_points(pts)
-    return inside.reshape(XX.shape)
-
-def _haversine_m(lat1, lon1, lat2, lon2):
-    """Great-circle distance in meters."""
-    R = 6371000.0
-    phi1 = np.radians(lat1)
-    phi2 = np.radians(lat2)
-    dphi = phi2 - phi1
-    dl = np.radians(lon2 - lon1)
-    a = np.sin(dphi / 2.0) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dl / 2.0) ** 2
-    return 2 * R * np.arcsin(np.minimum(1.0, np.sqrt(a)))
-
-def _interp_kernel(dist_m: np.ndarray, R_m: float, mode: str = "decay"):
-    """Kernel by distance in meters within radius R_m."""
-    x = np.clip(dist_m / max(R_m, 1e-6), 0.0, 1.0)
-    if mode == "grow":
-        w = x
-    else:
-        w = 1.0 - x
-    w[dist_m >= R_m] = 0.0
-    return w
-
-def _uab_tiled_choropleth_layer(df_uab: pd.DataFrame, *, tile_meters: float = 7.0,
-                                radius_m: float = 25.0, mode: str = "decay",
-                                value_mode: str = "conflictivity",
-                                max_tiles: int = 40000, colorscale=None):
-    """Create a Choroplethmapbox layer of rectangular tiles."""
-    if colorscale is None:
-        colorscale = [[0.0, 'rgb(0, 255, 0)'], [0.5, 'rgb(255, 255, 0)'], [1.0, 'rgb(255, 0, 0)']]
-
-    lons = df_uab["lon"].to_numpy(dtype=float)
-    lats = df_uab["lat"].to_numpy(dtype=float)
-    hull_poly = _compute_convex_hull_polygon(lons, lats)
-    if hull_poly is None:
-        return None, tile_meters, None
-
-    lat0 = float(np.mean(lats)) if len(lats) else 41.5
-    meters_per_deg_lat = 111_320.0
-    meters_per_deg_lon = 111_320.0 * np.cos(np.deg2rad(lat0))
-    dlat = tile_meters / meters_per_deg_lat
-    dlon = tile_meters / meters_per_deg_lon if meters_per_deg_lon > 0 else tile_meters / 100_000.0
-
-    minx, miny, maxx, maxy = hull_poly.bounds
-    lon_centers = np.arange(minx + dlon/2, maxx, dlon)
-    lat_centers = np.arange(miny + dlat/2, maxy, dlat)
-    XX, YY = np.meshgrid(lon_centers, lat_centers)
-    centers = np.column_stack([XX.ravel(), YY.ravel()])
-
-    x_h, y_h = hull_poly.exterior.coords.xy
-    poly_path = MplPath(np.vstack([x_h, y_h]).T)
-    inside = poly_path.contains_points(centers)
-    centers_in = centers[inside]
-
-    effective_tile_meters = tile_meters
-    n_tiles = centers_in.shape[0]
-    if n_tiles > max_tiles and n_tiles > 0:
-        factor = float(np.ceil(n_tiles / max_tiles))
-        effective_tile_meters = tile_meters * factor
-        dlat *= factor
-        dlon *= factor
-        lon_centers = np.arange(minx + dlon/2, maxx, dlon)
-        lat_centers = np.arange(miny + dlat/2, maxy, dlat)
-        XX, YY = np.meshgrid(lon_centers, lat_centers)
-        centers = np.column_stack([XX.ravel(), YY.ravel()])
-        inside = poly_path.contains_points(centers)
-        centers_in = centers[inside]
-
-    if centers_in.size == 0:
-        return None, effective_tile_meters, hull_poly
-
-    dists = _haversine_m(centers_in[:, 1][:, None], centers_in[:, 0][:, None], lats[None, :], lons[None, :])
-
-    if value_mode == "connectivity":
-        d_min = dists.min(axis=1)
-        z_pred = np.clip(d_min / max(radius_m, 1e-6), 0.0, 1.0)
-    else:
-        d_min = dists.min(axis=1)
-        boundary_conf = np.where(d_min >= radius_m, 1.0, d_min / max(radius_m, 1e-6))
-        cvals = df_uab["conflictivity"].to_numpy(dtype=float)
-        W = _interp_kernel(dists, radius_m, mode=mode)
-        denom = W.sum(axis=1)
-        with np.errstate(invalid='ignore', divide='ignore'):
-            num = (W * cvals[None, :]).sum(axis=1)
-            weighted_conf = np.where(denom > 0, num / denom, np.nan)
-        z_pred = np.maximum(weighted_conf, boundary_conf)
-        z_pred = np.clip(z_pred, 0.0, 1.0)
-
-    features = []
-    ids = []
-    for i, (lon_c, lat_c) in enumerate(centers_in):
-        lon0, lon1 = lon_c - dlon/2, lon_c + dlon/2
-        lat0, lat1 = lat_c - dlat/2, lat_c + dlat/2
-        poly_coords = [[
-            [lon0, lat0], [lon1, lat0], [lon1, lat1], [lon0, lat1], [lon0, lat0]
-        ]]
-        features.append({
-            "type": "Feature",
-            "id": str(i),
-            "properties": {},
-            "geometry": {"type": "Polygon", "coordinates": poly_coords}
-        })
-        ids.append(str(i))
-
-    geojson = {"type": "FeatureCollection", "features": features}
-
-    colorbar_title = "Connectivity" if value_mode == "connectivity" else "Conflictivity"
-    ch = go.Choroplethmapbox(
-        geojson=geojson,
-        locations=ids,
-        z=z_pred,
-        colorscale=colorscale,
-        zmin=0, zmax=1,
-        marker_opacity=0.9,
-        marker_line_width=0,
-        showscale=True,
-        colorbar=dict(title=colorbar_title, thickness=15, len=0.7),
-        name="UAB tiles",
-    )
-
-    return ch, effective_tile_meters, hull_poly
-
-def _inverted_weighted_voronoi_edges(df: pd.DataFrame, *, weight_col: str = "conflictivity",
-                                     radius_m: float = 25.0, clip_polygon=None,
-                                     tolerance_m: float = 8.0):
-    """Compute weighted Voronoi graph edges."""
-    if df.empty or weight_col not in df.columns:
-        return []
-    pts_lon = df["lon"].to_numpy(dtype=float)
-    pts_lat = df["lat"].to_numpy(dtype=float)
-    base = pd.to_numeric(df[weight_col], errors="coerce").fillna(0.0).to_numpy(dtype=float)
-    mn, mx = float(base.min()), float(base.max())
-    norm = (base - mn) / (mx - mn + 1e-12)
-    inv_w = 1.0 - norm
-
-    if len(pts_lon) < 3:
-        return []
-    try:
-        from scipy.spatial import Voronoi
-    except Exception:
-        return []
-    pts = np.column_stack([pts_lon, pts_lat])
-    try:
-        uniq, counts = np.unique(pts, axis=0, return_counts=True)
-        if np.any(counts > 1):
-            rng = np.random.RandomState(0)
-            pts = pts + rng.randn(*pts.shape) * 1e-8
-    except Exception:
-        pass
-    vor = Voronoi(pts)
-
-    edges = []
-    def _adiff(lon, lat, i1, i2):
-        d1 = _haversine_m(lat, lon, pts_lat[i1], pts_lon[i1])
-        d2 = _haversine_m(lat, lon, pts_lat[i2], pts_lon[i2])
-        return abs((d1 - inv_w[i1] * max(radius_m, 1e-6)) - (d2 - inv_w[i2] * max(radius_m, 1e-6)))
-
-    def _keep_and_clip_segment(a, b, i1, i2):
-        seg = LineString([a, b])
-        geom = seg if clip_polygon is None else seg.intersection(clip_polygon)
-        if geom.is_empty:
-            return []
-        parts = []
-        if geom.geom_type == 'LineString':
-            parts = [geom]
-        elif geom.geom_type == 'MultiLineString':
-            parts = list(geom.geoms)
-        kept = []
-        for ls in parts:
-            coords = list(ls.coords)
-            if len(coords) < 2:
-                continue
-            K = 7
-            min_diff = float('inf')
-            for t in np.linspace(0.1, 0.9, K):
-                x = coords[0][0] * (1 - t) + coords[-1][0] * t
-                y = coords[0][1] * (1 - t) + coords[-1][1] * t
-                min_diff = min(min_diff, _adiff(x, y, i1, i2))
-            if min_diff < tolerance_m:
-                (ax, ay), (bx, by) = coords[0], coords[-1]
-                kept.append((ax, ay, bx, by))
-        return kept
-
-    for (p1, p2), rv in zip(vor.ridge_points, vor.ridge_vertices):
-        if -1 not in rv:
-            vcoords = vor.vertices[rv]
-            lon1, lat1 = float(vcoords[0][0]), float(vcoords[0][1])
-            lon2, lat2 = float(vcoords[1][0]), float(vcoords[1][1])
-            kept = _keep_and_clip_segment((lon1, lat1), (lon2, lat2), p1, p2)
-            edges.extend(kept)
-        else:
-            vs = [v for v in rv if v != -1]
-            if not vs:
-                continue
-            v0 = vor.vertices[vs[0]]
-            lon0, lat0 = float(v0[0]), float(v0[1])
-            p1_xy = pts[[p1]][0]
-            p2_xy = pts[[p2]][0]
-            t = p2_xy - p1_xy
-            dir_vec = np.array([t[1], -t[0]], dtype=float)
-            nrm = np.linalg.norm(dir_vec)
-            if nrm == 0:
-                continue
-            dir_vec /= nrm
-            center = pts.mean(axis=0)
-            mid = (p1_xy + p2_xy) / 2.0
-            if np.dot(mid - center, dir_vec) < 0:
-                dir_vec *= -1.0
-            if clip_polygon is None:
-                continue
-            minx, miny, maxx, maxy = clip_polygon.bounds
-            L = max(maxx - minx, maxy - miny) * 5.0 + 1e-6
-            far = np.array([lon0, lat0]) + dir_vec * L
-            ray = LineString([(lon0, lat0), (float(far[0]), float(far[1]))])
-            inter = ray.intersection(clip_polygon)
-            if inter.is_empty:
-                continue
-            def _add_segment_from_linestring(ls):
-                coords = list(ls.coords)
-                if len(coords) >= 2:
-                    kept = _keep_and_clip_segment(coords[0], coords[-1], p1, p2)
-                    edges.extend(kept)
-            if inter.geom_type == 'LineString':
-                _add_segment_from_linestring(inter)
-            elif inter.geom_type == 'MultiLineString':
-                for ls in inter.geoms:
-                    _add_segment_from_linestring(ls)
-
-    if clip_polygon is not None:
-        clipped = []
-        for (x1, y1, x2, y2) in edges:
-            seg = LineString([(x1, y1), (x2, y2)])
-            inter = seg.intersection(clip_polygon)
-            if inter.is_empty:
-                continue
-            if inter.geom_type == 'LineString':
-                coords = list(inter.coords)
-                if len(coords) >= 2:
-                    (ax, ay), (bx, by) = coords[0], coords[-1]
-                    clipped.append((ax, ay, bx, by))
-            elif inter.geom_type == 'MultiLineString':
-                for seg2 in inter.geoms:
-                    coords = list(seg2.coords)
-                    if len(coords) >= 2:
-                        (ax, ay), (bx, by) = coords[0], coords[-1]
-                        clipped.append((ax, ay, bx, by))
-        edges = clipped
-    return edges
-
-def _top_conflictive_voronoi_vertices(df: pd.DataFrame, *, radius_m: float, coverage_poly: Polygon, k: int = 3) -> list:
-    """Return top-k Voronoi vertices with highest conflictivity score."""
-    if df.empty:
-        return []
-    try:
-        from scipy.spatial import Voronoi
-    except Exception:
-        return []
-    pts_lon = df["lon"].to_numpy(float)
-    pts_lat = df["lat"].to_numpy(float)
-    cvals = df["conflictivity"].to_numpy(float)
-    if len(pts_lon) < 3:
-        return []
-    pts = np.column_stack([pts_lon, pts_lat])
-    try:
-        uniq, counts = np.unique(pts, axis=0, return_counts=True)
-        if np.any(counts > 1):
-            rng = np.random.RandomState(7)
-            pts = pts + rng.randn(*pts.shape) * 1e-8
-    except Exception:
-        pass
-    vor = Voronoi(pts)
-    cand = []
-    for v in vor.vertices:
-        lon, lat = float(v[0]), float(v[1])
-        p = Point(lon, lat)
-        if not coverage_poly.contains(p):
-            continue
-        dists = _haversine_m(lat, lon, pts_lat, pts_lon)
-        dmin = dists.min()
-        boundary_conf = 1.0 if dmin >= radius_m else (dmin / max(radius_m, 1e-6))
-        W = _interp_kernel(dists, radius_m, mode="decay")
-        denom = W.sum()
-        if denom <= 0:
-            continue
-        weighted_conf = float((W * cvals).sum() / denom)
-        combined = max(weighted_conf, boundary_conf)
-        if boundary_conf >= 0.98 and weighted_conf < 0.5:
-            continue
-        cand.append((lon, lat, combined))
-    cand.sort(key=lambda t: t[2], reverse=True)
-    return cand[:max(0, int(k or 0))]
+# Note: _inverted_weighted_voronoi_edges and _top_conflictive_voronoi_vertices
+# are now imported from dashboard.voronoi_viz module (see imports above)
 
 def _snap_and_connect_edges(segments: list, clip_polygon: Polygon,
                             *, lat0: float, snap_m: float = 2.0, join_m: float = 4.0):
@@ -901,544 +527,6 @@ def _coverage_regions_from_uab_tiles(uab_df: pd.DataFrame, tile_meters: float, r
     final_polys = [p for p in polys if p.area > 0]
     return final_polys
 
-# ======== SIMULATOR MODE FUNCTIONS (from dashboard_voronoi_simulator.py) ========
-
-def recalculate_conflictivity(df: pd.DataFrame) -> pd.DataFrame:
-    """Full conflictivity recalculation after network changes."""
-    df['air_s_2g'] = df['util_2g'].apply(lambda u: airtime_score(u, "2g") if not np.isnan(u) else np.nan)
-    df['air_s_5g'] = df['util_5g'].apply(lambda u: airtime_score(u, "5g") if not np.isnan(u) else np.nan)
-    
-    df['airtime_score'] = np.nanmax(
-        np.vstack([df['air_s_2g'].fillna(-1), df['air_s_5g'].fillna(-1)]),
-        axis=0
-    )
-    df['airtime_score'] = df['airtime_score'].where(df['airtime_score'] >= 0, np.nan)
-    
-    p95 = float(np.nanpercentile(df['client_count'].fillna(0), 95)) if len(df) else 1.0
-    df['client_score'] = df['client_count'].apply(lambda n: client_pressure_score(n, p95))
-    
-    if 'cpu_utilization' not in df.columns:
-        df['cpu_utilization'] = 0.0
-    if 'mem_used_pct' not in df.columns:
-        df['mem_used_pct'] = 0.0
-    
-    df['cpu_score'] = df['cpu_utilization'].apply(cpu_health_score)
-    df['mem_score'] = df['mem_used_pct'].apply(mem_health_score)
-    
-    df['airtime_score_adj'] = [
-        (a * 0.8 if (c or 0) == 0 else a) if not np.isnan(a) else np.nan
-        for a, c in zip(df['airtime_score'], df['client_count'])
-    ]
-    
-    W_AIR, W_CL, W_CPU, W_MEM = 0.85, 0.10, 0.02, 0.03
-    df['airtime_score_filled'] = df['airtime_score_adj'].fillna(0.4)
-    df['conflictivity'] = (
-        df['airtime_score_filled'] * W_AIR +
-        df['client_score'].fillna(0) * W_CL +
-        df['cpu_score'].fillna(0) * W_CPU +
-        df['mem_score'].fillna(0) * W_MEM
-    ).clip(0, 1)
-    
-    return df
-
-
-def compute_rssi(distance_m: float, config) -> float:
-    """Compute RSSI using log-distance path loss model."""
-    if distance_m < config.reference_distance_m:
-        distance_m = config.reference_distance_m
-    
-    path_loss = 10 * config.path_loss_exponent * np.log10(
-        distance_m / config.reference_distance_m
-    )
-    
-    return config.reference_rssi_dbm - path_loss
-
-
-def estimate_client_distribution(
-    df_aps: pd.DataFrame,
-    new_ap_lat: float,
-    new_ap_lon: float,
-    config,
-    mode: str = 'hybrid'
-) -> Tuple[pd.DataFrame, Dict]:
-    """Simulate client redistribution when a new AP is added."""
-    df = df_aps.copy()
-    
-    df['dist_to_new'] = _haversine_m(
-        new_ap_lat, new_ap_lon,
-        df['lat'].values, df['lon'].values
-    )
-    
-    df['rssi_new'] = df['dist_to_new'].apply(lambda d: compute_rssi(d, config))
-    
-    df['in_range'] = df['dist_to_new'] <= config.interference_radius_m
-    
-    total_transferred = 0
-    
-    candidates = df[df['in_range'] & (df['client_count'] > 0)].copy()
-    
-    if not candidates.empty:
-        candidates = candidates.sort_values('dist_to_new', ascending=True)
-        
-        for idx, row in candidates.iterrows():
-            signal_strength = max(0.0, (row['rssi_new'] - config.min_rssi_dbm) / 20.0)
-            signal_strength = min(1.0, signal_strength)
-            
-            distance_factor = 1.0 - (row['dist_to_new'] / config.interference_radius_m)
-            distance_factor = max(0.0, min(1.0, distance_factor))
-            
-            conflict_factor = float(row.get('conflictivity', 0.5))
-            
-            transfer_potential = (
-                0.30 * signal_strength +
-                0.30 * distance_factor +
-                0.40 * conflict_factor
-            )
-            
-            transfer_fraction = min(config.max_offload_fraction, transfer_potential * 0.8)
-            
-            transfer_fraction *= (1 - config.sticky_client_fraction)
-            
-            n_transfer = max(1, int(row['client_count'] * transfer_fraction))
-            
-            n_transfer = min(n_transfer, int(row['client_count']))
-            
-            if n_transfer > 0:
-                df.at[idx, 'client_count'] = max(0, row['client_count'] - n_transfer)
-                total_transferred += n_transfer
-    
-    if total_transferred == 0 and not candidates.empty:
-        closest_with_clients = candidates.head(1)
-        if not closest_with_clients.empty:
-            idx = closest_with_clients.index[0]
-            n_transfer = max(1, int(df.at[idx, 'client_count'] * 0.1))
-            df.at[idx, 'client_count'] = max(0, df.at[idx, 'client_count'] - n_transfer)
-            total_transferred = n_transfer
-    
-    new_ap_stats = {
-        'lat': new_ap_lat,
-        'lon': new_ap_lon,
-        'client_count': total_transferred,
-        'name': 'AP-NEW-SIM',
-        'group_code': 'SIM',
-    }
-    
-    client_fraction = min(1.0, total_transferred / config.max_clients_per_ap)
-    new_ap_stats['util_2g'] = client_fraction * config.target_util_2g
-    new_ap_stats['util_5g'] = client_fraction * config.target_util_5g
-    
-    return df, new_ap_stats
-
-
-def apply_cca_interference(
-    df_aps: pd.DataFrame,
-    new_ap_stats: Dict,
-    config,
-) -> pd.DataFrame:
-    """Apply co-channel interference (CCA busy increase) to neighbors."""
-    df = df_aps.copy()
-    
-    distances = _haversine_m(
-        new_ap_stats['lat'], new_ap_stats['lon'],
-        df['lat'].values, df['lon'].values
-    )
-    
-    in_interference_range = distances <= config.interference_radius_m
-    
-    increase_factor = np.where(
-        in_interference_range,
-        config.cca_increase_factor * (1 - distances / config.interference_radius_m),
-        0.0
-    )
-    
-    df['util_2g'] = np.clip(
-        df['util_2g'] * (1 + increase_factor),
-        0.0, 100.0
-    )
-    df['util_5g'] = np.clip(
-        df['util_5g'] * (1 + increase_factor),
-        0.0, 100.0
-    )
-    
-    df['agg_util'] = np.maximum(df['util_2g'], df['util_5g'])
-    
-    return df
-
-
-def simulate_ap_addition(
-    df_baseline: pd.DataFrame,
-    new_ap_lat: float,
-    new_ap_lon: float,
-    config,
-    scorer,
-) -> Tuple[pd.DataFrame, Dict, Dict]:
-    """Simulate adding a new AP at given location."""
-    df_updated, new_ap_stats = estimate_client_distribution(
-        df_baseline, new_ap_lat, new_ap_lon, config, mode='hybrid'
-    )
-    
-    df_updated = apply_cca_interference(df_updated, new_ap_stats, config)
-    
-    df_updated = recalculate_conflictivity(df_updated)
-    
-    distances = _haversine_m(
-        new_ap_lat, new_ap_lon,
-        df_updated['lat'].values, df_updated['lon'].values
-    )
-    neighbor_mask = distances <= config.interference_radius_m
-    
-    baseline_conf = df_baseline['conflictivity'].values
-    updated_conf = df_updated['conflictivity'].values
-    
-    component_scores = scorer.compute_component_scores(
-        baseline_conf,
-        updated_conf,
-        neighbor_mask,
-    )
-    
-    composite_score = scorer.compute_composite_score(component_scores)
-    
-    warnings = scorer.generate_warnings(component_scores)
-    
-    metrics = {
-        **component_scores,
-        'composite_score': composite_score,
-        'warnings': warnings,
-        
-        'avg_conflictivity_before': float(baseline_conf.mean()),
-        'avg_conflictivity_after': float(updated_conf.mean()),
-        'avg_reduction': float(baseline_conf.mean() - updated_conf.mean()),
-        'avg_reduction_pct': float((baseline_conf.mean() - updated_conf.mean()) / baseline_conf.mean() * 100) if baseline_conf.mean() > 0 else 0.0,
-        
-        'worst_ap_conflictivity_before': float(baseline_conf.max()),
-        'worst_ap_conflictivity_after': float(updated_conf.max()),
-        'worst_ap_improvement': float(baseline_conf.max() - updated_conf.max()),
-        
-        'num_high_conflict_before': int((baseline_conf > 0.7).sum()),
-        'num_high_conflict_after': int((updated_conf > 0.7).sum()),
-        
-        'new_ap_client_count': new_ap_stats['client_count'],
-        'new_ap_util_2g': new_ap_stats['util_2g'],
-        'new_ap_util_5g': new_ap_stats['util_5g'],
-    }
-    
-    return df_updated, new_ap_stats, metrics
-
-
-def generate_candidate_locations(
-    df_aps: pd.DataFrame,
-    tile_meters: float,
-    conflictivity_threshold: float,
-    radius_m: float,
-    indoor_only: bool = True,
-    neighbor_radius_tiles: int = 1,
-    inner_clearance_m: float = 0.0,
-) -> pd.DataFrame:
-    """Generate candidate locations for new AP placement."""
-    lons = df_aps['lon'].values
-    lats = df_aps['lat'].values
-    pts = [Point(xy) for xy in zip(lons, lats)]
-    mp = MultiPoint(pts)
-    hull = mp.convex_hull
-    
-    lat0 = float(np.mean(lats))
-    meters_per_deg_lat = 111_320.0
-    meters_per_deg_lon = 111_320.0 * np.cos(np.deg2rad(lat0))
-    dlat = tile_meters / meters_per_deg_lat
-    dlon = tile_meters / meters_per_deg_lon
-    
-    minx, miny, maxx, maxy = hull.bounds
-    lon_centers = np.arange(minx + dlon/2, maxx, dlon)
-    lat_centers = np.arange(miny + dlat/2, maxy, dlat)
-    XX, YY = np.meshgrid(lon_centers, lat_centers)
-    
-    centers = np.column_stack([XX.ravel(), YY.ravel()])
-    
-    x_h, y_h = hull.exterior.coords.xy
-    poly_path = MplPath(np.vstack([x_h, y_h]).T)
-    inside = poly_path.contains_points(centers)
-    centers_in = centers[inside]
-    
-    if len(centers_in) == 0:
-        return pd.DataFrame()
-    
-    dists = _haversine_m(
-        centers_in[:, 1][:, None],
-        centers_in[:, 0][:, None],
-        lats[None, :],
-        lons[None, :]
-    )
-    d_min = dists.min(axis=1)
-    
-    R_m = radius_m
-    W = np.maximum(0, 1 - dists / R_m)
-    W[dists >= R_m] = 0
-    
-    cvals = df_aps['conflictivity'].values
-    denom = W.sum(axis=1)
-    
-    with np.errstate(invalid='ignore', divide='ignore'):
-        num = (W * cvals[None, :]).sum(axis=1)
-    z_pred = np.where(denom > 0, num / denom, 0.0)
-    
-    painted_tiles = set()
-    conf_grid = np.full((len(lat_centers), len(lon_centers)), np.nan)
-    coord_to_idx = {}
-    
-    for i, (lon, lat) in enumerate(centers_in):
-        lon_idx = min(range(len(lon_centers)), key=lambda x: abs(lon_centers[x] - lon))
-        lat_idx = min(range(len(lat_centers)), key=lambda x: abs(lat_centers[x] - lat))
-        
-        painted_tiles.add((lat_idx, lon_idx))
-        conf_grid[lat_idx, lon_idx] = z_pred[i]
-        coord_to_idx[(lat_idx, lon_idx)] = i
-    
-    neighbor_offsets = [
-        (dy, dx)
-        for dy in range(-neighbor_radius_tiles, neighbor_radius_tiles + 1)
-        for dx in range(-neighbor_radius_tiles, neighbor_radius_tiles + 1)
-        if not (dy == 0 and dx == 0)
-    ]
-    
-    valid_tiles_mask = np.zeros(len(centers_in), dtype=bool)
-    boundary_mask = np.zeros(len(centers_in), dtype=bool)
-    
-    for i, (lon, lat) in enumerate(centers_in):
-        lon_idx = min(range(len(lon_centers)), key=lambda x: abs(lon_centers[x] - lon))
-        lat_idx = min(range(len(lat_centers)), key=lambda x: abs(lat_centers[x] - lat))
-        
-        immediate_offsets = [
-            (-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1)
-        ]
-        is_boundary = False
-        for dy, dx in immediate_offsets:
-            n_lat = lat_idx + dy
-            n_lon = lon_idx + dx
-            if (n_lat, n_lon) not in painted_tiles:
-                is_boundary = True
-                break
-        boundary_mask[i] = is_boundary
-
-        all_neighbors_painted = True
-        for dlat_idx, dlon_idx in neighbor_offsets:
-            neighbor_lat_idx = lat_idx + dlat_idx
-            neighbor_lon_idx = lon_idx + dlon_idx
-            if (neighbor_lat_idx, neighbor_lon_idx) not in painted_tiles:
-                all_neighbors_painted = False
-                break
-        if all_neighbors_painted and not is_boundary:
-            valid_tiles_mask[i] = True
-    
-    inner_mask = d_min < max(0.0, radius_m - inner_clearance_m)
-    final_mask = valid_tiles_mask & inner_mask
-    
-    centers_in = centers_in[final_mask]
-    z_pred = z_pred[final_mask]
-    boundary_mask = boundary_mask[final_mask]
-    d_min = d_min[final_mask]
-    
-    if len(centers_in) == 0:
-        return pd.DataFrame()
-    
-    candidates = pd.DataFrame({
-        'lon': centers_in[:, 0],
-        'lat': centers_in[:, 1],
-        'conflictivity': z_pred,
-        'is_boundary': boundary_mask,
-        'min_dist_m': d_min,
-    })
-    
-    candidates = candidates[(candidates['conflictivity'] >= conflictivity_threshold) & (~candidates['is_boundary'])].copy()
-    
-    candidates['reason'] = 'high_conflictivity_interior_non_boundary'
-    
-    return candidates.reset_index(drop=True)
-
-
-def generate_voronoi_candidates(
-    scenarios: list,
-    geo_df: pd.DataFrame,
-    radius_m: float,
-    conflictivity_threshold: float,
-    tile_radius_clearance_m: float,
-    merge_radius_m: float = 8.0,
-    max_vertices_per_scenario: int = 60,
-) -> pd.DataFrame:
-    """Generate AP candidate locations using Voronoi vertices across multiple scenarios."""
-    if not _HAS_SCIPY_VORONOI:
-        st.error("SciPy not available: install scipy to enable Voronoi candidate mode.")
-        return pd.DataFrame()
-
-    records = []
-    effective_max_dist = max(0.0, radius_m - tile_radius_clearance_m)
-
-    for profile, snap_path, snap_dt in scenarios:
-        try:
-            df_snap = read_ap_snapshot(snap_path, band_mode='worst')
-            df_snap = df_snap.merge(geo_df, on='name', how='inner')
-            df_snap = df_snap[df_snap['group_code'] != 'SAB'].copy()
-            if df_snap.empty:
-                continue
-            pts_xy = df_snap[['lon', 'lat']].to_numpy()
-            if len(pts_xy) < 3:
-                continue
-            vor = Voronoi(pts_xy)
-            hull_poly = MultiPoint([Point(xy) for xy in pts_xy]).convex_hull
-            lons = df_snap['lon'].to_numpy()
-            lats = df_snap['lat'].to_numpy()
-            cvals = df_snap['conflictivity'].to_numpy()
-            for vidx, (vx, vy) in enumerate(vor.vertices):
-                p = Point(vx, vy)
-                if not hull_poly.contains(p):
-                    continue
-                dists = _haversine_m(vy, vx, lats, lons)
-                d_min = float(dists.min())
-                if d_min >= effective_max_dist:
-                    continue
-                w = np.maximum(0.0, 1 - dists / radius_m)
-                w[dists >= radius_m] = 0.0
-                if w.sum() == 0:
-                    continue
-                conf_pred = float((w * cvals).sum() / w.sum())
-                if conf_pred < conflictivity_threshold:
-                    continue
-                records.append({
-                    'lon': vx,
-                    'lat': vy,
-                    'conflictivity': conf_pred,
-                    'min_dist_m': d_min,
-                    'scenario_ts': snap_dt,
-                    'stress_profile': profile.value,
-                })
-        except Exception as e:
-            st.warning(f"Voronoi generation error for {snap_path.name}: {e}")
-            continue
-
-    if not records:
-        return pd.DataFrame()
-
-    df_all = pd.DataFrame(records)
-    df_all['scenario_key'] = df_all['scenario_ts'].astype(str)
-    df_all = df_all.sort_values(['scenario_key', 'conflictivity'], ascending=[True, False])
-    df_all = df_all.groupby('scenario_key').head(max_vertices_per_scenario).reset_index(drop=True)
-
-    clusters = []
-    merge_r = merge_radius_m
-    for row in df_all.itertuples():
-        placed = False
-        for cl in clusters:
-            d = _haversine_m(row.lat, row.lon, cl['lat'], cl['lon'])
-            if d <= merge_r:
-                cl['points'].append(row)
-                lats_cl = [p.lat for p in cl['points']]
-                lons_cl = [p.lon for p in cl['points']]
-                cl['lat'] = float(np.mean(lats_cl))
-                cl['lon'] = float(np.mean(lons_cl))
-                placed = True
-                break
-        if not placed:
-            clusters.append({'lat': row.lat, 'lon': row.lon, 'points': [row]})
-
-    out_rows = []
-    for cl in clusters:
-        pts = cl['points']
-        confs = [p.conflictivity for p in pts]
-        dmins = [p.min_dist_m for p in pts]
-        scenarios_list = [str(p.scenario_ts) for p in pts]
-        stress_profiles = [p.stress_profile for p in pts]
-        out_rows.append({
-            'lat': cl['lat'],
-            'lon': cl['lon'],
-            'avg_conflictivity': float(np.mean(confs)),
-            'max_conflictivity': float(np.max(confs)),
-            'freq': len(pts),
-            'avg_min_dist_m': float(np.mean(dmins)),
-            'scenarios': scenarios_list,
-            'stress_profiles': stress_profiles,
-        })
-
-    df_clusters = pd.DataFrame(out_rows)
-    df_clusters['conflictivity'] = df_clusters['avg_conflictivity']
-    df_clusters = df_clusters.sort_values(['freq', 'avg_conflictivity'], ascending=[False, False]).reset_index(drop=True)
-    return df_clusters
-
-
-def aggregate_scenario_results(
-    lat: float,
-    lon: float,
-    base_conflictivity: float,
-    scenario_results: List[Dict],
-) -> Dict:
-    """Aggregate metrics across scenarios."""
-    aggregated = {
-        'lat': lat,
-        'lon': lon,
-        'base_conflictivity': base_conflictivity,
-        'n_scenarios': len(scenario_results),
-    }
-    
-    scores = [r['composite_score'] for r in scenario_results]
-    aggregated['final_score'] = float(np.mean(scores))
-    aggregated['score_std'] = float(np.std(scores))
-    aggregated['score_min'] = float(np.min(scores))
-    aggregated['score_max'] = float(np.max(scores))
-    
-    for key in ['worst_ap_improvement_raw', 'avg_reduction_raw', 'num_improved', 'new_ap_client_count']:
-        values = [r.get(key, 0) for r in scenario_results]
-        aggregated[f'{key}_mean'] = float(np.mean(values))
-        aggregated[f'{key}_std'] = float(np.std(values))
-    
-    all_warnings = []
-    for r in scenario_results:
-        all_warnings.extend(r.get('warnings', []))
-    
-    warning_counts = Counter(all_warnings)
-    aggregated['warnings'] = [
-        f"{msg} (in {count}/{len(scenario_results)} scenarios)"
-        for msg, count in warning_counts.most_common()
-    ]
-    
-    by_profile = {}
-    for r in scenario_results:
-        profile = r.get('stress_profile', 'unknown')
-        if profile not in by_profile:
-            by_profile[profile] = []
-        by_profile[profile].append(r['composite_score'])
-    
-    for profile, profile_scores in by_profile.items():
-        aggregated[f'score_{profile}'] = float(np.mean(profile_scores))
-    
-    return aggregated
-
-
-def simulate_multiple_ap_additions(
-    df_baseline: pd.DataFrame,
-    points: List[Dict],
-    config,
-) -> pd.DataFrame:
-    """Approximate combined effect of adding multiple APs by applying them sequentially."""
-    df_curr = df_baseline.copy()
-    for i, p in enumerate(points, start=1):
-        lat = float(p['lat'])
-        lon = float(p['lon'])
-        df_curr, new_ap_stats = estimate_client_distribution(df_curr, lat, lon, config, mode='hybrid')
-        df_curr = apply_cca_interference(df_curr, new_ap_stats, config)
-        new_row = {
-            'name': f'AP-NEW-SIM-{i}',
-            'group_code': 'SIM',
-            'lat': lat,
-            'lon': lon,
-            'client_count': new_ap_stats.get('client_count', 0),
-            'util_2g': new_ap_stats.get('util_2g', 0.0),
-            'util_5g': new_ap_stats.get('util_5g', 0.0),
-            'cpu_utilization': 0.0,
-            'mem_used_pct': 0.0,
-            'agg_util': max(new_ap_stats.get('util_2g', 0.0), new_ap_stats.get('util_5g', 0.0)),
-        }
-        df_curr = pd.concat([df_curr, pd.DataFrame([new_row])], ignore_index=True)
-        df_curr = recalculate_conflictivity(df_curr)
-    return df_curr
-
 # -------- UI --------
 st.set_page_config(page_title="UAB Wi‑Fi Integrated Dashboard", page_icon="📶", layout="wide")
 st.title("UAB Wi‑Fi Integrated Dashboard")
@@ -1464,7 +552,7 @@ with st.sidebar:
     st.header("Visualization Mode")
     
     # Show Simulator option only if simulator module is available
-    if SIMULATOR_AVAILABLE:
+    if simulator_available:
         viz_mode = st.radio(
             "Select Mode",
             options=["AI Heatmap", "Voronoi", "Simulator"],
@@ -1519,8 +607,6 @@ with st.sidebar:
                            help="Distància màxima perquè la connectivitat arribi a 1")
         value_mode = st.selectbox("Mode de valor", ["conflictivity", "connectivity"], index=0,
                                 help="conflictivity: ponderació dels APs; connectivity: creix fins a 1 al radi")
-        TILE_M_FIXED = 7.0
-        MAX_TILES_NO_LIMIT = 1_000_000_000
         
         st.divider()
         st.header("Voronoi ponderat")
@@ -1531,9 +617,8 @@ with st.sidebar:
             index=0,
             help="Es normalitza i s'inverteix: pes = 1 - norm(col)."
         )
-        VOR_TOL_M_FIXED = 24.0
-        SNAP_M_DEFAULT = float(max(1.5, TILE_M_FIXED * 0.2))
-        JOIN_M_DEFAULT = float(max(3.0, TILE_M_FIXED * 0.6))
+        snap_m = float(max(1.5, TILE_M_FIXED * 0.2))
+        join_m = float(max(3.0, TILE_M_FIXED * 0.6))
         show_hot_vertex = st.checkbox("Marcar punt més conflictiu (vertex Voronoi)", value=False,
                                     help="Evalua vertices del Voronoi i marca el de major conflictivitat.")
         min_conf = 0.0
@@ -1541,8 +626,7 @@ with st.sidebar:
     else:  # Simulator
         radius_m = 25
         value_mode = "conflictivity"
-        TILE_M_FIXED = 7.0
-        MAX_TILES_NO_LIMIT = 1_000_000_000
+        # Using module-level constants TILE_M_FIXED and MAX_TILES_NO_LIMIT
         min_conf = 0.0
         top_n = 15
         
@@ -1680,7 +764,7 @@ with st.sidebar:
         st.divider()
         st.subheader("🧩 Voronoi Candidate Discovery")
         st.caption("Detect stable high-conflictivity Voronoi vertex clusters across representative scenarios before full simulation.")
-        if not _HAS_SCIPY_VORONOI:
+        if not has_scipy_voronoi:
             st.warning("SciPy Voronoi is required to auto-detect candidate vertices.")
         else:
             voronoi_signature = (
@@ -1987,13 +1071,17 @@ Si n'hi ha un numero alt d'ambos, doncs clarament el raonament es ambdos. Pero 2
 
 if viz_mode == "AI Heatmap":
     # ========== AI HEATMAP MODE ==========
+    config = HeatmapConfig(
+        min_conflictivity=min_conf,
+        marker_radius=5,
+        default_zoom=15,
+    )
+    
     fig = create_optimized_heatmap(
         df=map_df,
         center_lat=center_lat,
         center_lon=center_lon,
-        min_conflictivity=min_conf,
-        radius=5,
-        zoom=15,
+        config=config,
     )
 
     fig.update_layout(clickmode='event+select')
@@ -2282,7 +1370,7 @@ else:  # Simulator
         ))
     
     # Run simulation if enabled
-    if run_simulation and st.session_state.get('run_sim', False) and SIMULATOR_AVAILABLE:
+    if run_simulation and st.session_state.get('run_sim', False) and simulator_available:
         params = st.session_state.get('sim_params', {})
         sim_top_k = params.get('top_k', 3)
         sim_threshold = params.get('threshold', 0.6)

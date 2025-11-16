@@ -1,0 +1,8 @@
+{
+  "typeCheckingMode": "strict",
+  "stubPath": "typings",
+  "include": ["src"],
+  "reportMissingTypeStubs": "warning",
+  "venvPath": ".",
+  "venv": ".venv"
+}
