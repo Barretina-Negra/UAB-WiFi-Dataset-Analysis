@@ -1498,8 +1498,7 @@ with st.sidebar:
         
         st.divider()
         st.header("Voronoi ponderat")
-        show_awvd = st.checkbox("Mostrar arestes Voronoi ponderat", value=True,
-                              help="Aproximació additivament ponderada (edges)")
+        show_awvd = True
         weight_source = st.selectbox(
             "Base connectivitat (per invertir)",
             ["conflictivity", "client_count", "max_radio_util", "airtime_score"],
