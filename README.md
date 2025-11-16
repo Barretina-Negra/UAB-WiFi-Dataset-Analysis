@@ -50,11 +50,18 @@ Our integrated dashboard (`deliverable/integrated_dashboard.py`) provides three 
 ## 🚀 Quick Start
 
 ### Prerequisites
+Install [uv](https://docs.astral.sh/uv/) if you don't have it yet:
 ```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
+
+Create and sync the local environment (this creates/updates `.venv` automatically):
+```bash
+uv sync
+source .venv/bin/activate  # On Windows: .\.venv\Scripts\activate
+```
+
+Need optional tooling? Add `--group ml`, `--group llm`, etc. to pull in the extras defined in `pyproject.toml`.
 
 ### Environment Setup
 Create a `.env` file in the project root:
@@ -64,12 +71,12 @@ AINA_API_KEY=your_aina_api_key_here
 
 ### Run the Dashboard
 ```bash
-streamlit run deliverable/integrated_dashboard.py
+uv run streamlit run deliverable/integrated_dashboard.py
 ```
 
 Or with specific server settings:
 ```bash
-streamlit run deliverable/integrated_dashboard.py --server.headless true --server.port 8501
+uv run streamlit run deliverable/integrated_dashboard.py --server.headless true --server.port 8501
 ```
 
 ## 🗂️ Repository Structure
