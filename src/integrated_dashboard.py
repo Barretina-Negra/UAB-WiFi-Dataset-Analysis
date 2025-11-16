@@ -96,6 +96,32 @@ def find_snapshot_files(ap_dir: Path) -> List[Tuple[Path, datetime]]:
     files_with_time.sort(key=lambda x: x[1])
     return files_with_time
 
+
+def resolve_stress_profiles(
+    target: Optional["StressLevel"],
+    stats: Dict["StressLevel", Dict[str, float]],
+) -> Tuple[List["StressLevel"], Optional["StressLevel"], Optional[str]]:
+    """Pick stress profiles to simulate, falling back gracefully when data is missing."""
+    priority = [StressLevel.CRITICAL, StressLevel.HIGH, StressLevel.MEDIUM, StressLevel.LOW]
+    counts = {lvl: stats.get(lvl, {}).get('count', 0) for lvl in priority}
+    available = [lvl for lvl in priority if counts.get(lvl, 0) > 0]
+
+    if target is None:
+        if not available:
+            return [], None, "No snapshots available in any stress profile."
+        effective_target = None if len(available) > 1 else available[0]
+        return available, effective_target, None
+
+    if counts.get(target, 0) > 0:
+        return [target], target, None
+
+    if available:
+        fallback = available[0]
+        message = f"No snapshots found for stress profile {target.value}. Falling back to {fallback.value}."
+        return [fallback], fallback, message
+
+    return [], None, "No snapshots available to run the simulator."
+
 # --- Scoring utilities ----------------------------------------------------
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -1523,8 +1549,7 @@ with st.sidebar:
         st.divider()
         st.header("🎯 AP Placement Simulator")
         
-        run_simulation = st.checkbox("Enable AP Placement Simulation", value=False,
-                                     help="Find optimal locations for new APs using multi-scenario analysis")
+        run_simulation = True
         
         if run_simulation:
             st.subheader("Simulation Parameters")
@@ -1624,77 +1649,103 @@ with st.sidebar:
             }
             sim_stress_profile_key = stress_display_map[sim_stress_profile]
             
-            if st.button("🚀 Run Multi-Scenario Simulation", type="primary", disabled=abs(total_weight - 1.0) > 0.01):
+            weights_ok = abs(total_weight - 1.0) <= 0.01
+            sim_param_payload = {
+                'top_k': sim_top_k,
+                'threshold': sim_threshold,
+                'stress_profile': sim_stress_profile_key,
+                'snapshots': sim_snapshots_per_profile,
+                'interference_radius': sim_interference_radius,
+                'cca_increase': sim_cca_increase,
+                'w_worst': w_worst,
+                'w_avg': w_avg,
+                'w_cov': w_cov,
+                'w_neigh': w_neigh,
+                'candidate_mode': sim_candidate_mode,
+                'merge_radius': sim_merge_radius,
+                'interior_buffer_tiles': sim_interior_buffer_tiles,
+                'inner_clearance_m': sim_inner_clearance_m,
+            }
+
+            if weights_ok:
                 st.session_state.run_sim = True
-                st.session_state.sim_params = {
-                    'top_k': sim_top_k,
-                    'threshold': sim_threshold,
-                    'stress_profile': sim_stress_profile_key,
-                    'snapshots': sim_snapshots_per_profile,
-                    'interference_radius': sim_interference_radius,
-                    'cca_increase': sim_cca_increase,
-                    'w_worst': w_worst,
-                    'w_avg': w_avg,
-                    'w_cov': w_cov,
-                    'w_neigh': w_neigh,
-                    'candidate_mode': sim_candidate_mode,
-                    'merge_radius': sim_merge_radius,
-                    'interior_buffer_tiles': sim_interior_buffer_tiles,
-                    'inner_clearance_m': sim_inner_clearance_m,
-                }
+                st.session_state.sim_params = sim_param_payload
             else:
-                if 'run_sim' not in st.session_state:
-                    st.session_state.run_sim = False
+                st.session_state.run_sim = False
+                st.info("Ajusta els pesos perquè sumin 1.0 per executar la simulació automàticament.")
+
+            run_simulation = weights_ok
         
         # Voronoi Candidate Discovery (Step 1 of new workflow)
         st.divider()
         st.subheader("🧩 Voronoi Candidate Discovery")
         st.caption("Detect stable high-conflictivity Voronoi vertex clusters across representative scenarios before full simulation.")
-        detect_voronoi = st.button("🔍 Detect Voronoi Vertices", disabled=not _HAS_SCIPY_VORONOI)
-        if detect_voronoi:
-            # Build scenarios similar to simulation preparation
-            stress_map = {
-                "HIGH": StressLevel.HIGH,
-                "CRITICAL": StressLevel.CRITICAL,
-                "MEDIUM": StressLevel.MEDIUM,
-                "LOW": StressLevel.LOW,
-                "ALL": None
-            }
-            target_stress = stress_map.get(sim_stress_profile_key, StressLevel.HIGH)
-            profiler = StressProfiler(
-                snapshots,
-                utilization_threshold_critical=85,
-                utilization_threshold_high=70,
+        if not _HAS_SCIPY_VORONOI:
+            st.warning("SciPy Voronoi is required to auto-detect candidate vertices.")
+        else:
+            voronoi_signature = (
+                sim_stress_profile_key,
+                sim_snapshots_per_profile,
+                round(radius_m, 2),
+                round(sim_threshold, 3),
+                round(sim_inner_clearance_m, 2),
+                round(sim_merge_radius, 2),
             )
-            stress_profiles = profiler.classify_snapshots()
-            if target_stress is None:
-                profiles_to_test = [StressLevel.LOW, StressLevel.MEDIUM, StressLevel.HIGH, StressLevel.CRITICAL]
+            prev_signature = st.session_state.get("voronoi_signature")
+            need_detection = (
+                'voronoi_candidates' not in st.session_state
+                or st.session_state.voronoi_candidates is None
+                or st.session_state.voronoi_candidates.empty
+                or prev_signature != voronoi_signature
+            )
+
+            if need_detection:
+                with st.spinner("🔍 Detectant vertices Voronoi automàticament..."):
+                    stress_map = {
+                        "HIGH": StressLevel.HIGH,
+                        "CRITICAL": StressLevel.CRITICAL,
+                        "MEDIUM": StressLevel.MEDIUM,
+                        "LOW": StressLevel.LOW,
+                        "ALL": None
+                    }
+                    target_stress = stress_map.get(sim_stress_profile_key, StressLevel.HIGH)
+                    profiler = StressProfiler(
+                        snapshots,
+                        utilization_threshold_critical=85,
+                        utilization_threshold_high=70,
+                    )
+                    stress_profiles = profiler.classify_snapshots()
+                    stats = profiler.get_profile_statistics()
+                    profiles_to_test, effective_target, profile_message = resolve_stress_profiles(target_stress, stats)
+                    if profile_message:
+                        st.info(f"ℹ️ {profile_message}")
+                    all_scenarios = []
+                    for profile in profiles_to_test:
+                        snaps_sel = profiler.get_representative_snapshots(profile, n_samples=sim_snapshots_per_profile)
+                        for path, dt in snaps_sel:
+                            all_scenarios.append((profile, path, dt))
+                    st.session_state.voronoi_scenarios = all_scenarios
+                    if not all_scenarios:
+                        st.warning("No scenarios available for Voronoi detection.")
+                    else:
+                        st.info(f"Voronoi: Using {len(all_scenarios)} scenarios across {len(profiles_to_test)} profiles.")
+                        vor_df = generate_voronoi_candidates(
+                            all_scenarios,
+                            geo_df=geo_df,
+                            radius_m=radius_m,
+                            conflictivity_threshold=sim_threshold,
+                            tile_radius_clearance_m=sim_inner_clearance_m,
+                            merge_radius_m=sim_merge_radius,
+                            max_vertices_per_scenario=60,
+                        )
+                        st.session_state.voronoi_candidates = vor_df
+                        st.session_state.voronoi_signature = voronoi_signature
+                        if vor_df.empty:
+                            st.warning("No Voronoi candidates detected. Try lowering conflictivity threshold or clearance.")
+                        else:
+                            st.success(f"Detected {len(vor_df)} Voronoi candidate clusters.")
             else:
-                profiles_to_test = [target_stress]
-            all_scenarios = []
-            for profile in profiles_to_test:
-                snaps_sel = profiler.get_representative_snapshots(profile, n_samples=sim_snapshots_per_profile)
-                for path, dt in snaps_sel:
-                    all_scenarios.append((profile, path, dt))
-            st.session_state.voronoi_scenarios = all_scenarios
-            if not all_scenarios:
-                st.warning("No scenarios available for Voronoi detection.")
-            else:
-                st.info(f"Voronoi: Using {len(all_scenarios)} scenarios across {len(profiles_to_test)} profiles.")
-                vor_df = generate_voronoi_candidates(
-                    all_scenarios,
-                    geo_df=geo_df,
-                    radius_m=radius_m,
-                    conflictivity_threshold=sim_threshold,
-                    tile_radius_clearance_m=sim_inner_clearance_m,
-                    merge_radius_m=sim_merge_radius,
-                    max_vertices_per_scenario=60,
-                )
-                st.session_state.voronoi_candidates = vor_df
-                if vor_df.empty:
-                    st.warning("No Voronoi candidates detected. Try lowering conflictivity threshold or clearance.")
-                else:
-                    st.success(f"Detected {len(vor_df)} Voronoi candidate clusters.")
+                st.caption("Voronoi candidates already generated for the current parameters.")
 
 # Load and compute
 ap_df = read_ap_snapshot(selected_path, band_mode=band_mode)
@@ -2247,7 +2298,7 @@ else:  # Simulator
         sim_merge_radius = params.get('merge_radius', 8)
         sim_interior_buffer_tiles = params.get('interior_buffer_tiles', 2)
         sim_inner_clearance_m = params.get('inner_clearance_m', 10)
-        
+
         with st.spinner("🔍 Running multi-scenario AP placement simulation..."):
             try:
                 stress_map = {
@@ -2258,7 +2309,7 @@ else:  # Simulator
                     "ALL": None
                 }
                 target_stress = stress_map.get(sim_stress_profile, StressLevel.HIGH)
-                
+
                 config = SimulationConfig(
                     interference_radius_m=sim_interference_radius,
                     cca_increase_factor=sim_cca_increase,
@@ -2271,18 +2322,18 @@ else:  # Simulator
                     weight_coverage=w_cov,
                     weight_neighborhood=w_neigh,
                 )
-                
+
                 profiler = StressProfiler(
                     snapshots,
                     utilization_threshold_critical=config.utilization_threshold_critical,
                     utilization_threshold_high=config.utilization_threshold_high,
                 )
-                
+
                 st.info("📊 Classifying snapshots by stress level...")
                 stress_profiles = profiler.classify_snapshots()
-                
+
                 stats = profiler.get_profile_statistics()
-                
+
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     st.metric("LOW", f"{stats[StressLevel.LOW]['count']} snaps", 
@@ -2296,234 +2347,284 @@ else:  # Simulator
                 with col4:
                     st.metric("CRITICAL", f"{stats[StressLevel.CRITICAL]['count']} snaps",
                              f"{stats[StressLevel.CRITICAL]['percentage']:.1f}%")
-                
-                if target_stress is None:
-                    profiles_to_test = [StressLevel.LOW, StressLevel.MEDIUM, StressLevel.HIGH, StressLevel.CRITICAL]
-                else:
-                    profiles_to_test = [target_stress]
-                
-                all_scenarios = []
-                for profile in profiles_to_test:
-                    snaps = profiler.get_representative_snapshots(profile, n_samples=sim_snapshots_per_profile)
-                    for path, dt in snaps:
-                        all_scenarios.append((profile, path, dt))
-                
-                if not all_scenarios:
-                    st.error(f"❌ No snapshots found for stress profile: {sim_stress_profile}")
+
+                profiles_to_test, effective_target, profile_message = resolve_stress_profiles(target_stress, stats)
+                config.target_stress_profile = effective_target
+                if profile_message:
+                    st.info(f"ℹ️ {profile_message}")
+
+                should_run = True
+                if not profiles_to_test:
+                    st.warning("No snapshots available for the simulator right now. Showing current map only.")
                     st.session_state.run_sim = False
-                    st.stop()
-                
-                st.success(f"✅ Testing {len(all_scenarios)} scenarios across {len(profiles_to_test)} stress profile(s)")
-                
-                # Generate candidates based on mode
-                if sim_candidate_mode == "Voronoi (network-aware)":
-                    st.info(f"📍 Generating Voronoi candidate locations (merge_radius={sim_merge_radius}m, threshold={sim_threshold})...")
-                    candidates = generate_voronoi_candidates(
-                        all_scenarios,
-                        geo_df,
-                        radius_m,
-                        sim_threshold,
-                        tile_radius_clearance_m=5.0,
-                        merge_radius_m=sim_merge_radius,
-                        max_vertices_per_scenario=60,
-                    )
+                    st.session_state.pop('map_override_df', None)
+                    st.session_state.pop('map_preview_metrics', None)
+                    st.session_state.pop('new_node_markers', None)
+                    should_run = False
                 else:
-                    first_path = all_scenarios[0][1]
-                    df_first = read_ap_snapshot(first_path, band_mode='worst')
-                    df_first = df_first.merge(geo_df, on='name', how='inner')
-                    df_first = df_first[df_first['group_code'] != 'SAB'].copy()
-                    
-                    if df_first.empty:
-                        st.warning("⚠️ No UAB APs available for simulation")
+                    all_scenarios = []
+                    for profile in profiles_to_test:
+                        snaps = profiler.get_representative_snapshots(profile, n_samples=sim_snapshots_per_profile)
+                        for path, dt in snaps:
+                            all_scenarios.append((profile, path, dt))
+
+                    if not all_scenarios:
+                        st.warning("⚠️ Snapshot pool empty for the selected filters. Keeping current view.")
                         st.session_state.run_sim = False
-                        st.stop()
+                        st.session_state.pop('map_override_df', None)
+                        st.session_state.pop('map_preview_metrics', None)
+                        st.session_state.pop('new_node_markers', None)
+                        should_run = False
+
+                if should_run:
+                    st.success(f"✅ Testing {len(all_scenarios)} scenarios across {len(profiles_to_test)} stress profile(s)")
                     
-                    st.info(f"📍 Generating tile-based candidate locations (tile_size={TILE_M_FIXED}m, threshold={sim_threshold})...")
-                    
-                    candidates = generate_candidate_locations(
-                        df_first,
-                        tile_meters=TILE_M_FIXED,
-                        conflictivity_threshold=sim_threshold,
-                        radius_m=radius_m,
-                        indoor_only=config.indoor_only,
-                        neighbor_radius_tiles=sim_interior_buffer_tiles,
-                        inner_clearance_m=sim_inner_clearance_m,
-                    )
-                
-                if candidates.empty:
-                    st.warning(f"⚠️ No candidates found with conflictivity > {sim_threshold}")
-                    st.session_state.run_sim = False
-                    st.stop()
-                
-                st.success(f"✅ Found {len(candidates)} candidate locations")
-                st.info(f"🧪 Evaluating top {min(sim_top_k, len(candidates))} candidates across scenarios...")
-                
-                scorer = CompositeScorer(
-                    weight_worst_ap=w_worst,
-                    weight_average=w_avg,
-                    weight_coverage=w_cov,
-                    weight_neighborhood=w_neigh,
-                    neighborhood_mode=NeighborhoodOptimizationMode.BALANCED,
-                    interference_radius_m=sim_interference_radius,
-                )
-                
-                results = []
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                total_sims = min(sim_top_k, len(candidates)) * len(all_scenarios)
-                sim_count = 0
-                
-                for cand_idx, cand_row in candidates.head(sim_top_k).iterrows():
-                    scenario_results = []
-                    
-                    for profile, snap_path, snap_dt in all_scenarios:
-                        sim_count += 1
-                        progress = sim_count / total_sims
-                        progress_bar.progress(progress)
-                        status_text.text(f"Evaluating candidate {cand_idx+1}/{min(sim_top_k, len(candidates))} | "
-                                       f"Scenario {sim_count}/{total_sims} ({profile.value})")
-                        
-                        df_scenario = read_ap_snapshot(snap_path, band_mode='worst')
-                        df_scenario = df_scenario.merge(geo_df, on='name', how='inner')
-                        df_scenario = df_scenario[df_scenario['group_code'] != 'SAB'].copy()
-                        
-                        _, new_ap_stats, metrics = simulate_ap_addition(
-                            df_scenario,
-                            cand_row['lat'],
-                            cand_row['lon'],
-                            config,
-                            scorer,
+                    # Generate candidates based on mode
+                    if sim_candidate_mode == "Voronoi (network-aware)":
+                        st.info(f"📍 Generating Voronoi candidate locations (merge_radius={sim_merge_radius}m, threshold={sim_threshold})...")
+                        candidates = generate_voronoi_candidates(
+                            all_scenarios,
+                            geo_df,
+                            radius_m,
+                            sim_threshold,
+                            tile_radius_clearance_m=5.0,
+                            merge_radius_m=sim_merge_radius,
+                            max_vertices_per_scenario=60,
                         )
+                    else:
+                        first_path = all_scenarios[0][1]
+                        df_first = read_ap_snapshot(first_path, band_mode='worst')
+                        df_first = df_first.merge(geo_df, on='name', how='inner')
+                        df_first = df_first[df_first['group_code'] != 'SAB'].copy()
                         
-                        metrics['stress_profile'] = profile.value
-                        metrics['timestamp'] = snap_dt
-                        scenario_results.append(metrics)
+                        if df_first.empty:
+                            st.warning("⚠️ No UAB APs available for simulation")
+                            st.session_state.run_sim = False
+                            should_run = False
+                        else:
+                            st.info(f"📍 Generating tile-based candidate locations (tile_size={TILE_M_FIXED}m, threshold={sim_threshold})...")
+                            
+                            candidates = generate_candidate_locations(
+                                df_first,
+                                tile_meters=TILE_M_FIXED,
+                                conflictivity_threshold=sim_threshold,
+                                radius_m=radius_m,
+                                indoor_only=config.indoor_only,
+                                neighbor_radius_tiles=sim_interior_buffer_tiles,
+                                inner_clearance_m=sim_inner_clearance_m,
+                            )
                     
-                    aggregated = aggregate_scenario_results(
-                        cand_row['lat'],
-                        cand_row['lon'],
-                        cand_row.get('conflictivity', 0.0),
-                        scenario_results,
-                    )
-                    
-                    results.append(aggregated)
-                
-                progress_bar.empty()
-                status_text.empty()
-                
-                results_df = pd.DataFrame(results)
-                results_df = results_df.sort_values('final_score', ascending=False)
-                
-                if len(results_df) > 0:
-                    best = results_df.iloc[0]
-                    fig.add_trace(go.Scattermapbox(
-                        lat=[best['lat']],
-                        lon=[best['lon']],
-                        mode='markers',
-                        marker=dict(
-                            size=5,
-                            color='blue',
-                            opacity=0.8
-                        ),
-                        name='🎯 Best Location',
-                        hovertemplate=(
-                            '<b>🎯 Best Placement Location</b><br>'
-                            'Final Score: %{customdata[0]:.3f} ± %{customdata[1]:.3f}<br>'
-                            'Avg Reduction: %{customdata[2]:.3f}<br>'
-                            'Worst AP Improvement: %{customdata[3]:.3f}<br>'
-                            'New AP Clients: %{customdata[4]:.0f}<br>'
-                            'Scenarios Tested: %{customdata[5]:.0f}<br>'
-                            '<extra></extra>'
-                        ),
-                        customdata=np.column_stack([
-                            [best['final_score']],
-                            [best['score_std']],
-                            [best['avg_reduction_raw_mean']],
-                            [best['worst_ap_improvement_raw_mean']],
-                            [best['new_ap_client_count_mean']],
-                            [best['n_scenarios']],
-                        ]),
-                    ))
-                
-                for idx, row in results_df.iterrows():
-                    rank = idx + 1
-                    
-                    fig.add_trace(go.Scattermapbox(
-                        lat=[row['lat']],
-                        lon=[row['lon']],
-                        mode='markers+text',
-                        marker=dict(
-                            size=5,
-                            color='purple',
-                            opacity=0.9
-                        ),
-                        text=f"#{rank}",
-                        textposition="top center",
-                        textfont=dict(size=10, color='white', family='Arial Black'),
-                        name=f'Proposed AP #{rank}',
-                        hovertemplate=(
-                            f'<b>Proposed AP #{rank}</b><br>'
-                            'Score: %{customdata[0]:.3f} ± %{customdata[1]:.3f}<br>'
-                            'Avg Reduction: %{customdata[2]:.3f}<br>'
-                            'Worst AP Improvement: %{customdata[3]:.3f}<br>'
-                            'New AP Clients: %{customdata[4]:.0f}<br>'
-                            '<extra></extra>'
-                        ),
-                        customdata=np.column_stack([
-                            [row['final_score']],
-                            [row['score_std']],
-                            [row['avg_reduction_raw_mean']],
-                            [row['worst_ap_improvement_raw_mean']],
-                            [row['new_ap_client_count_mean']],
-                        ]),
-                    ))
-                
-                st.divider()
-                st.subheader("📊 Multi-Scenario Simulation Results")
-                
-                display_cols = ['lat', 'lon', 'final_score', 'score_std', 'avg_reduction_raw_mean', 
-                               'worst_ap_improvement_raw_mean', 'num_improved_mean', 'new_ap_client_count_mean', 'n_scenarios']
-                display_df = results_df[display_cols].copy()
-                display_df.columns = ['Latitude', 'Longitude', 'Final Score', 'Std Dev', 'Avg Reduction', 
-                                     'Worst AP Improv', '# Improved APs', 'New AP Clients', 'Scenarios']
-                
-                st.dataframe(
-                    display_df.style.format({
-                        'Latitude': '{:.6f}',
-                        'Longitude': '{:.6f}',
-                        'Final Score': '{:.3f}',
-                        'Std Dev': '{:.3f}',
-                        'Avg Reduction': '{:.3f}',
-                        'Worst AP Improv': '{:.3f}',
-                        '# Improved APs': '{:.1f}',
-                        'New AP Clients': '{:.0f}',
-                        'Scenarios': '{:.0f}',
-                    }).background_gradient(subset=['Final Score'], cmap='RdYlGn'),
-                    use_container_width=True
-                )
-                
-                col1, col2, col3, col4 = st.columns(4)
-                best = results_df.iloc[0]
-                
-                with col1:
-                    st.metric("Best Score", f"{best['final_score']:.3f}", 
-                             delta=f"±{best['score_std']:.3f}")
-                with col2:
-                    st.metric("Avg Reduction", f"{best['avg_reduction_raw_mean']:.3f}")
-                with col3:
-                    st.metric("Worst AP Improvement", f"{best['worst_ap_improvement_raw_mean']:.3f}")
-                with col4:
-                    st.metric("New AP Clients", f"{int(best['new_ap_client_count_mean'])}")
-                
-                if best.get('warnings'):
-                    st.subheader("⚠️ Placement Warnings")
-                    for warning in best['warnings']:
-                        st.warning(warning)
-                else:
-                    st.success("✅ No significant warnings for this placement")
-                
-                st.success(f"💡 **Recommendation**: Place new AP at ({best['lat']:.6f}, {best['lon']:.6f}) for maximum network improvement across {best['n_scenarios']:.0f} scenarios")
+                    if not should_run:
+                        pass
+                    else:
+                        if candidates.empty:
+                            st.warning(f"⚠️ No candidates found with conflictivity > {sim_threshold}")
+                            st.session_state.run_sim = False
+                        else:
+                            st.success(f"✅ Found {len(candidates)} candidate locations")
+                            st.info(f"🧪 Evaluating top {min(sim_top_k, len(candidates))} candidates across scenarios...")
+                            
+                            scorer = CompositeScorer(
+                                weight_worst_ap=w_worst,
+                                weight_average=w_avg,
+                                weight_coverage=w_cov,
+                                weight_neighborhood=w_neigh,
+                                neighborhood_mode=NeighborhoodOptimizationMode.BALANCED,
+                                interference_radius_m=sim_interference_radius,
+                            )
+                            
+                            results = []
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+                            
+                            total_sims = min(sim_top_k, len(candidates)) * len(all_scenarios)
+                            sim_count = 0
+                            
+                            for cand_idx, cand_row in candidates.head(sim_top_k).iterrows():
+                                scenario_results = []
+                                
+                                for profile, snap_path, snap_dt in all_scenarios:
+                                    sim_count += 1
+                                    progress = sim_count / total_sims
+                                    progress_bar.progress(progress)
+                                    status_text.text(f"Evaluating candidate {cand_idx+1}/{min(sim_top_k, len(candidates))} | "
+                                                   f"Scenario {sim_count}/{total_sims} ({profile.value})")
+                                    
+                                    df_scenario = read_ap_snapshot(snap_path, band_mode='worst')
+                                    df_scenario = df_scenario.merge(geo_df, on='name', how='inner')
+                                    df_scenario = df_scenario[df_scenario['group_code'] != 'SAB'].copy()
+                                    
+                                    _, new_ap_stats, metrics = simulate_ap_addition(
+                                        df_scenario,
+                                        cand_row['lat'],
+                                        cand_row['lon'],
+                                        config,
+                                        scorer,
+                                    )
+                                    
+                                    metrics['stress_profile'] = profile.value
+                                    metrics['timestamp'] = snap_dt
+                                    scenario_results.append(metrics)
+                                
+                                aggregated = aggregate_scenario_results(
+                                    cand_row['lat'],
+                                    cand_row['lon'],
+                                    cand_row.get('conflictivity', 0.0),
+                                    scenario_results,
+                                )
+                                
+                                results.append(aggregated)
+                            
+                            progress_bar.empty()
+                            status_text.empty()
+                            
+                            results_df = pd.DataFrame(results)
+                            results_df = results_df.sort_values('final_score', ascending=False)
+                            
+                            if len(results_df) > 0:
+                                best = results_df.iloc[0]
+                                fig.add_trace(go.Scattermapbox(
+                                    lat=[best['lat']],
+                                    lon=[best['lon']],
+                                    mode='markers',
+                                    marker=dict(
+                                        size=5,
+                                        color='blue',
+                                        opacity=0.8
+                                    ),
+                                    name='🎯 Best Location',
+                                    hovertemplate=(
+                                        '<b>🎯 Best Placement Location</b><br>'
+                                        'Final Score: %{customdata[0]:.3f} ± %{customdata[1]:.3f}<br>'
+                                        'Avg Reduction: %{customdata[2]:.3f}<br>'
+                                        'Worst AP Improvement: %{customdata[3]:.3f}<br>'
+                                        'New AP Clients: %{customdata[4]:.0f}<br>'
+                                        'Scenarios Tested: %{customdata[5]:.0f}<br>'
+                                        '<extra></extra>'
+                                    ),
+                                    customdata=np.column_stack([
+                                        [best['final_score']],
+                                        [best['score_std']],
+                                        [best['avg_reduction_raw_mean']],
+                                        [best['worst_ap_improvement_raw_mean']],
+                                        [best['new_ap_client_count_mean']],
+                                        [best['n_scenarios']],
+                                    ]),
+                                ))
+                            
+                            for idx, row in results_df.iterrows():
+                                rank = idx + 1
+                                
+                                fig.add_trace(go.Scattermapbox(
+                                    lat=[row['lat']],
+                                    lon=[row['lon']],
+                                    mode='markers+text',
+                                    marker=dict(
+                                        size=5,
+                                        color='purple',
+                                        opacity=0.9
+                                    ),
+                                    text=f"#{rank}",
+                                    textposition="top center",
+                                    textfont=dict(size=10, color='white', family='Arial Black'),
+                                    name=f'Proposed AP #{rank}',
+                                    hovertemplate=(
+                                        f'<b>Proposed AP #{rank}</b><br>'
+                                        'Score: %{customdata[0]:.3f} ± %{customdata[1]:.3f}<br>'
+                                        'Avg Reduction: %{customdata[2]:.3f}<br>'
+                                        'Worst AP Improvement: %{customdata[3]:.3f}<br>'
+                                        'New AP Clients: %{customdata[4]:.0f}<br>'
+                                        '<extra></extra>'
+                                    ),
+                                    customdata=np.column_stack([
+                                        [row['final_score']],
+                                        [row['score_std']],
+                                        [row['avg_reduction_raw_mean']],
+                                        [row['worst_ap_improvement_raw_mean']],
+                                        [row['new_ap_client_count_mean']],
+                                    ]),
+                                ))
+                            
+                            st.divider()
+                            st.subheader("📊 Multi-Scenario Simulation Results")
+                            
+                            display_cols = ['lat', 'lon', 'final_score', 'score_std', 'avg_reduction_raw_mean', 
+                                           'worst_ap_improvement_raw_mean', 'num_improved_mean', 'new_ap_client_count_mean', 'n_scenarios']
+                            display_df = results_df[display_cols].copy()
+                            display_df.columns = ['Latitude', 'Longitude', 'Final Score', 'Std Dev', 'Avg Reduction', 
+                                                 'Worst AP Improv', '# Improved APs', 'New AP Clients', 'Scenarios']
+                            
+                            st.dataframe(
+                                display_df.style.format({
+                                    'Latitude': '{:.6f}',
+                                    'Longitude': '{:.6f}',
+                                    'Final Score': '{:.3f}',
+                                    'Std Dev': '{:.3f}',
+                                    'Avg Reduction': '{:.3f}',
+                                    'Worst AP Improv': '{:.3f}',
+                                    '# Improved APs': '{:.1f}',
+                                    'New AP Clients': '{:.0f}',
+                                    'Scenarios': '{:.0f}',
+                                }).background_gradient(subset=['Final Score'], cmap='RdYlGn'),
+                                use_container_width=True
+                            )
+                            
+                            col1, col2, col3, col4 = st.columns(4)
+                            best = results_df.iloc[0]
+                            
+                            with col1:
+                                st.metric("Best Score", f"{best['final_score']:.3f}", 
+                                         delta=f"±{best['score_std']:.3f}")
+                            with col2:
+                                st.metric("Avg Reduction", f"{best['avg_reduction_raw_mean']:.3f}")
+                            with col3:
+                                st.metric("Worst AP Improvement", f"{best['worst_ap_improvement_raw_mean']:.3f}")
+                            with col4:
+                                st.metric("New AP Clients", f"{int(best['new_ap_client_count_mean'])}")
+                            
+                            if best.get('warnings'):
+                                st.subheader("⚠️ Placement Warnings")
+                                for warning in best['warnings']:
+                                    st.warning(warning)
+                            else:
+                                st.success("✅ No significant warnings for this placement")
+                            
+                            st.success(f"💡 **Recommendation**: Place new AP at ({best['lat']:.6f}, {best['lon']:.6f}) for maximum network improvement across {best['n_scenarios']:.0f} scenarios")
+
+                            preview_metrics = None
+                            try:
+                                base_latest = read_ap_snapshot(selected_path, band_mode='worst').merge(geo_df, on='name', how='inner')
+                                base_latest = base_latest[base_latest['group_code'] != 'SAB'].copy()
+                                if not base_latest.empty:
+                                    df_after_preview, _, preview_metrics = simulate_ap_addition(
+                                        base_latest,
+                                        float(best['lat']),
+                                        float(best['lon']),
+                                        config,
+                                        scorer,
+                                    )
+                                    st.session_state['map_override_df'] = df_after_preview
+                                    st.session_state['new_node_markers'] = [{
+                                        'lat': float(best['lat']),
+                                        'lon': float(best['lon']),
+                                        'label': 'AP-BEST'
+                                    }]
+                                    st.session_state['map_preview_metrics'] = preview_metrics
+                                else:
+                                    st.warning("Cannot build simulated map: no UAB APs in the selected snapshot after filtering.")
+                            except Exception as e:
+                                st.warning(f"Preview map update failed: {e}")
+
+                            if preview_metrics:
+                                col_before, col_after, col_delta = st.columns(3)
+                                with col_before:
+                                    st.metric("Avg conflictivity (current)", f"{preview_metrics['avg_conflictivity_before']:.3f}")
+                                with col_after:
+                                    st.metric("Avg conflictivity (simulated)", f"{preview_metrics['avg_conflictivity_after']:.3f}")
+                                with col_delta:
+                                    st.metric("Avg improvement", f"{preview_metrics['avg_reduction']:.3f}", 
+                                              delta=f"{preview_metrics['avg_reduction_pct']:.1f}%")
+                                st.caption("Metrics computed on the currently selected snapshot to compare the before/after map views.")
                 
             except Exception as e:
                 st.error(f"❌ Simulation error: {str(e)}")
