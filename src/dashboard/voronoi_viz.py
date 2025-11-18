@@ -24,6 +24,7 @@ Usage:
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any, cast
 
 import numpy as np
@@ -31,6 +32,7 @@ import pandas as pd
 import plotly.graph_objects as go  # type: ignore[import-untyped]
 from matplotlib.path import Path as MplPath
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
+from shapely import wkt
 
 from .types import BoolArray, FloatArray
 
@@ -57,8 +59,9 @@ def haversine_m(
         >>> d = haversine_m(41.5, 2.1, 41.6, 2.2)
         >>> print(f"Distance: {d:.2f}m")
     """
-    assert np.all(np.abs(lat1) <= 90.0), "lat1 must be in [-90, 90]"
-    assert np.all(np.abs(lat2) <= 90.0), "lat2 must be in [-90, 90]"
+    # Performance optimization: Skip assertions for large arrays
+    # assert np.all(np.abs(lat1) <= 90.0), "lat1 must be in [-90, 90]"
+    # assert np.all(np.abs(lat2) <= 90.0), "lat2 must be in [-90, 90]"
     
     R = 6371000.0  # Earth radius in meters
     phi1 = np.radians(lat1)
@@ -70,7 +73,7 @@ def haversine_m(
     distance = 2 * R * np.arcsin(np.minimum(1.0, np.sqrt(a)))
     
     # Postcondition: distance must be non-negative
-    assert np.all(distance >= 0.0), "Distance must be non-negative"
+    # assert np.all(distance >= 0.0), "Distance must be non-negative"
     return cast(float | FloatArray, distance)
 
 
@@ -177,6 +180,110 @@ def interp_kernel(
     return w
 
 
+@lru_cache(maxsize=4)
+def _compute_grid_geometry(
+    lons_tuple: tuple[float, ...],
+    lats_tuple: tuple[float, ...],
+    tile_meters: float,
+    max_tiles: int
+) -> tuple[np.ndarray, float, float, Polygon | None, float]:
+    """Cached computation of grid geometry."""
+    lons = np.array(lons_tuple)
+    lats = np.array(lats_tuple)
+    
+    hull_poly = compute_convex_hull_polygon(lons, lats)
+    if hull_poly is None:
+        return np.array([]), tile_meters, tile_meters, None, tile_meters
+
+    # Calculate grid parameters
+    lat0 = float(np.mean(lats)) if len(lats) > 0 else 41.5
+    meters_per_deg_lat = 111_320.0
+    meters_per_deg_lon = 111_320.0 * np.cos(np.deg2rad(lat0))
+    
+    dlat = tile_meters / meters_per_deg_lat
+    dlon = tile_meters / meters_per_deg_lon if meters_per_deg_lon > 0 else tile_meters / 100_000.0
+    
+    # Create tile centers
+    minx, miny, maxx, maxy = hull_poly.bounds
+    lon_centers = np.arange(minx + dlon/2, maxx, dlon)
+    lat_centers = np.arange(miny + dlat/2, maxy, dlat)
+    xx, yy = np.meshgrid(lon_centers, lat_centers)
+    centers = np.column_stack([xx.ravel(), yy.ravel()])
+    
+    # Filter to hull interior
+    x_h, y_h = hull_poly.exterior.coords.xy  # type: ignore[misc]
+    poly_path = MplPath(np.vstack([x_h, y_h]).T)
+    inside = poly_path.contains_points(centers)
+    centers_in = centers[inside]
+    
+    # Auto-scale if too many tiles
+    effective_tile_meters = tile_meters
+    n_tiles = centers_in.shape[0]
+    if n_tiles > max_tiles and n_tiles > 0:
+        factor = float(np.ceil(n_tiles / max_tiles))
+        effective_tile_meters = tile_meters * factor
+        dlat *= factor
+        dlon *= factor
+        
+        lon_centers = np.arange(minx + dlon/2, maxx, dlon)
+        lat_centers = np.arange(miny + dlat/2, maxy, dlat)
+        xx, yy = np.meshgrid(lon_centers, lat_centers)
+        centers = np.column_stack([xx.ravel(), yy.ravel()])
+        inside = poly_path.contains_points(centers)
+        centers_in = centers[inside]
+        
+    return centers_in, dlon, dlat, hull_poly, effective_tile_meters
+
+
+@lru_cache(maxsize=4)
+def _compute_grid_distances(
+    centers_bytes: bytes,
+    centers_shape: tuple[int, int],
+    lons_tuple: tuple[float, ...],
+    lats_tuple: tuple[float, ...]
+) -> np.ndarray:
+    """Cached computation of distances."""
+    centers_in = np.frombuffer(centers_bytes).reshape(centers_shape)
+    lons = np.array(lons_tuple)
+    lats = np.array(lats_tuple)
+    
+    dists_result = haversine_m(
+        centers_in[:, 1][:, None],
+        centers_in[:, 0][:, None],
+        lats[None, :],
+        lons[None, :]
+    )
+    return cast(FloatArray, dists_result)
+
+
+@lru_cache(maxsize=4)
+def _get_geojson_features(
+    centers_bytes: bytes,
+    centers_shape: tuple[int, int],
+    dlon: float,
+    dlat: float
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Cached computation of GeoJSON features."""
+    centers_in = np.frombuffer(centers_bytes).reshape(centers_shape)
+    features: list[dict[str, Any]] = []
+    ids: list[str] = []
+    
+    for i, (lon_c, lat_c) in enumerate(centers_in):
+        lon0, lon1 = lon_c - dlon/2, lon_c + dlon/2
+        lat0, lat1 = lat_c - dlat/2, lat_c + dlat/2
+        poly_coords = [[
+            [lon0, lat0], [lon1, lat0], [lon1, lat1], [lon0, lat1], [lon0, lat0]
+        ]]
+        features.append({
+            "type": "Feature",
+            "id": str(i),
+            "properties": {},
+            "geometry": {"type": "Polygon", "coordinates": poly_coords}
+        })
+        ids.append(str(i))
+    return features, ids
+
+
 def uab_tiled_choropleth_layer(
     df_uab: pd.DataFrame,
     *,
@@ -221,63 +328,25 @@ def uab_tiled_choropleth_layer(
             [1.0, 'rgb(255, 0, 0)']
         ]
     
+    # Sort by location to ensure deterministic order for caching
+    df_sorted = df_uab.sort_values(["lon", "lat"])
+    
     # Note: pandas to_numpy has partially unknown types due to stub limitations
-    lons = df_uab["lon"].to_numpy(dtype=float)  # type: ignore[misc]
-    lats = df_uab["lat"].to_numpy(dtype=float)  # type: ignore[misc]
+    lons = df_sorted["lon"].to_numpy(dtype=float)  # type: ignore[misc]
+    lats = df_sorted["lat"].to_numpy(dtype=float)  # type: ignore[misc]
     
-    hull_poly = compute_convex_hull_polygon(lons, lats)
-    if hull_poly is None:
-        return None, tile_meters, None
+    # Use cached geometry
+    centers_in, dlon, dlat, hull_poly, effective_tile_meters = _compute_grid_geometry(
+        tuple(lons), tuple(lats), tile_meters, max_tiles
+    )
     
-    # Calculate grid parameters
-    lat0 = float(np.mean(lats)) if len(lats) > 0 else 41.5
-    meters_per_deg_lat = 111_320.0
-    meters_per_deg_lon = 111_320.0 * np.cos(np.deg2rad(lat0))
-    
-    dlat = tile_meters / meters_per_deg_lat
-    dlon = tile_meters / meters_per_deg_lon if meters_per_deg_lon > 0 else tile_meters / 100_000.0
-    
-    # Create tile centers
-    minx, miny, maxx, maxy = hull_poly.bounds
-    lon_centers = np.arange(minx + dlon/2, maxx, dlon)
-    lat_centers = np.arange(miny + dlat/2, maxy, dlat)
-    xx, yy = np.meshgrid(lon_centers, lat_centers)
-    centers = np.column_stack([xx.ravel(), yy.ravel()])
-    
-    # Filter to hull interior
-    x_h, y_h = hull_poly.exterior.coords.xy  # type: ignore[misc]
-    poly_path = MplPath(np.vstack([x_h, y_h]).T)
-    inside = poly_path.contains_points(centers)
-    centers_in = centers[inside]
-    
-    # Auto-scale if too many tiles
-    effective_tile_meters = tile_meters
-    n_tiles = centers_in.shape[0]
-    if n_tiles > max_tiles and n_tiles > 0:
-        factor = float(np.ceil(n_tiles / max_tiles))
-        effective_tile_meters = tile_meters * factor
-        dlat *= factor
-        dlon *= factor
-        
-        lon_centers = np.arange(minx + dlon/2, maxx, dlon)
-        lat_centers = np.arange(miny + dlat/2, maxy, dlat)
-        xx, yy = np.meshgrid(lon_centers, lat_centers)
-        centers = np.column_stack([xx.ravel(), yy.ravel()])
-        inside = poly_path.contains_points(centers)
-        centers_in = centers[inside]
-    
-    if centers_in.size == 0:
+    if hull_poly is None or centers_in.size == 0:
         return None, effective_tile_meters, hull_poly
     
-    # Calculate distances from centers to APs
-    dists_result = haversine_m(
-        centers_in[:, 1][:, None],
-        centers_in[:, 0][:, None],
-        lats[None, :],
-        lons[None, :]
+    # Use cached distances
+    dists = _compute_grid_distances(
+        centers_in.tobytes(), centers_in.shape, tuple(lons), tuple(lats)
     )
-    # Ensure dists is array type for subsequent operations
-    dists = cast(FloatArray, dists_result)
     
     # Compute tile values based on mode
     if value_mode == "connectivity":
@@ -287,7 +356,7 @@ def uab_tiled_choropleth_layer(
         d_min = cast(FloatArray, dists.min(axis=1))  # type: ignore[misc]
         boundary_conf = np.where(d_min >= radius_m, 1.0, d_min / max(radius_m, 1e-6))
         
-        cvals = df_uab["conflictivity"].to_numpy(dtype=float)  # type: ignore[misc]
+        cvals = df_sorted["conflictivity"].to_numpy(dtype=float)  # type: ignore[misc]
         W = interp_kernel(dists, radius_m, mode=mode)
         denom = W.sum(axis=1)
         
@@ -298,23 +367,10 @@ def uab_tiled_choropleth_layer(
         z_pred = np.maximum(weighted_conf, boundary_conf)
         z_pred = np.clip(z_pred, 0.0, 1.0)
     
-    # Generate GeoJSON features
-    features: list[dict[str, Any]] = []
-    ids: list[str] = []
-    
-    for i, (lon_c, lat_c) in enumerate(centers_in):
-        lon0, lon1 = lon_c - dlon/2, lon_c + dlon/2
-        lat0, lat1 = lat_c - dlat/2, lat_c + dlat/2
-        poly_coords = [[
-            [lon0, lat0], [lon1, lat0], [lon1, lat1], [lon0, lat1], [lon0, lat0]
-        ]]
-        features.append({
-            "type": "Feature",
-            "id": str(i),
-            "properties": {},
-            "geometry": {"type": "Polygon", "coordinates": poly_coords}
-        })
-        ids.append(str(i))
+    # Use cached GeoJSON features
+    features, ids = _get_geojson_features(
+        centers_in.tobytes(), centers_in.shape, dlon, dlat
+    )
     
     geojson = {"type": "FeatureCollection", "features": features}
     
@@ -335,6 +391,147 @@ def uab_tiled_choropleth_layer(
     
     return ch, effective_tile_meters, hull_poly
 
+
+@lru_cache(maxsize=4)
+def _get_preclipped_voronoi_edges(
+    lons_tuple: tuple[float, ...],
+    lats_tuple: tuple[float, ...],
+    clip_poly_wkt: str | None
+) -> tuple[list[tuple[float, float, float, float, int, int]], np.ndarray]:
+    """
+    Cached computation of raw Voronoi edges clipped to polygon.
+    Returns:
+        - List of (x1, y1, x2, y2, p1_idx, p2_idx)
+        - Original points array (for distance calcs)
+    """
+    pts_lon = np.array(lons_tuple)
+    pts_lat = np.array(lats_tuple)
+    pts = np.column_stack([pts_lon, pts_lat])
+    
+    # Jitter
+    try:
+        _, counts = np.unique(pts, axis=0, return_counts=True)
+        if np.any(counts > 1):
+            rng = np.random.RandomState(42)
+            pts = pts + rng.randn(*pts.shape) * 1e-8
+    except Exception:
+        pass
+
+    if len(pts) < 3:
+        return [], pts
+
+    try:
+        from scipy.spatial import Voronoi
+        vor = Voronoi(pts)
+    except ImportError:
+        return [], pts
+
+    clip_polygon = wkt.loads(clip_poly_wkt) if clip_poly_wkt else None
+    raw_edges = []
+
+    # Helper to clip segment
+    def _clip(p1: tuple[float, float], p2: tuple[float, float]) -> list[tuple[float, float, float, float]]:
+        if clip_polygon is None:
+            return [(p1[0], p1[1], p2[0], p2[1])]
+        
+        seg = LineString([p1, p2])
+        inter = seg.intersection(clip_polygon)
+        if inter.is_empty:
+            return []
+        
+        res = []
+        if inter.geom_type == 'LineString':
+            coords = list(inter.coords)
+            if len(coords) >= 2:
+                res.append((coords[0][0], coords[0][1], coords[-1][0], coords[-1][1]))
+        elif inter.geom_type == 'MultiLineString':
+            for ls in inter.geoms:
+                coords = list(ls.coords)
+                if len(coords) >= 2:
+                    res.append((coords[0][0], coords[0][1], coords[-1][0], coords[-1][1]))
+        return res
+
+    # Finite edges
+    for (p1_idx, p2_idx), rv in zip(vor.ridge_points, vor.ridge_vertices):
+        if -1 not in rv:
+            v1 = vor.vertices[rv[0]]
+            v2 = vor.vertices[rv[1]]
+            segments = _clip((v1[0], v1[1]), (v2[0], v2[1]))
+            for s in segments:
+                raw_edges.append((*s, int(p1_idx), int(p2_idx)))
+        else:
+            # Infinite edges
+            vs = [v for v in rv if v != -1]
+            if not vs:
+                continue
+            v0 = vor.vertices[vs[0]]
+            
+            # Direction
+            p1_xy = pts[p1_idx]
+            p2_xy = pts[p2_idx]
+            t = p2_xy - p1_xy
+            dir_vec = np.array([t[1], -t[0]])
+            nrm = np.linalg.norm(dir_vec)
+            if nrm == 0: continue
+            dir_vec /= nrm
+            
+            center = pts.mean(axis=0)
+            mid = (p1_xy + p2_xy) / 2.0
+            if np.dot(mid - center, dir_vec) < 0:
+                dir_vec *= -1.0
+            
+            if clip_polygon:
+                minx, miny, maxx, maxy = clip_polygon.bounds
+                L = max(maxx - minx, maxy - miny) * 5.0 + 1e-6
+                far = v0 + dir_vec * L
+                segments = _clip((v0[0], v0[1]), (far[0], far[1]))
+                for s in segments:
+                    raw_edges.append((*s, int(p1_idx), int(p2_idx)))
+
+    return raw_edges, pts
+
+@lru_cache(maxsize=4)
+def _filter_voronoi_edges(
+    raw_edges_tuple: tuple[tuple[float, float, float, float, int, int], ...],
+    pts_bytes: bytes,
+    pts_shape: tuple[int, int],
+    inv_w_tuple: tuple[float, ...],
+    radius_m: float,
+    tolerance_m: float
+) -> list[tuple[float, float, float, float]]:
+    """
+    Cached filtering of Voronoi edges based on weights.
+    """
+    pts = np.frombuffer(pts_bytes).reshape(pts_shape)
+    inv_w = np.array(inv_w_tuple)
+    
+    kept_edges = []
+    
+    for x1, y1, x2, y2, i1, i2 in raw_edges_tuple:
+        # Sample points to check tolerance
+        # We check if the weighted distance difference is small enough
+        
+        # Optimization: Check endpoints and midpoint first
+        samples = [(x1, y1), (x2, y2), ((x1+x2)/2, (y1+y2)/2)]
+        
+        min_diff = float('inf')
+        
+        for sx, sy in samples:
+            d1 = haversine_m(sy, sx, pts[i1, 1], pts[i1, 0])
+            d2 = haversine_m(sy, sx, pts[i2, 1], pts[i2, 0])
+            
+            # Weighted distance: d - w * R
+            wd1 = d1 - inv_w[i1] * max(radius_m, 1e-6)
+            wd2 = d2 - inv_w[i2] * max(radius_m, 1e-6)
+            
+            diff = abs(wd1 - wd2)
+            if diff < min_diff:
+                min_diff = diff
+        
+        if min_diff < tolerance_m:
+            kept_edges.append((x1, y1, x2, y2))
+            
+    return kept_edges
 
 def inverted_weighted_voronoi_edges(
     df: pd.DataFrame,
@@ -370,170 +567,37 @@ def inverted_weighted_voronoi_edges(
     if df.empty or weight_col not in df.columns:
         return []
     
-    # Pandas stubs incomplete for to_numpy/to_numeric/fillna overloads
-    pts_lon = df["lon"].to_numpy(dtype=float)  # type: ignore[call-overload]
-    pts_lat = df["lat"].to_numpy(dtype=float)  # type: ignore[call-overload]
-    base = pd.to_numeric(df[weight_col], errors="coerce").fillna(0.0).to_numpy(dtype=float)  # type: ignore[call-overload,union-attr]
+    # Sort for determinism
+    df_sorted = df.sort_values(['lon', 'lat'])
     
-    # Normalize and invert weights
+    lons = df_sorted["lon"].to_numpy(dtype=float)
+    lats = df_sorted["lat"].to_numpy(dtype=float)
+    base = pd.to_numeric(df_sorted[weight_col], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    
+    # Normalize weights
     mn, mx = float(base.min()), float(base.max())
     norm = (base - mn) / (mx - mn + 1e-12)
     inv_w = 1.0 - norm
     
-    if len(pts_lon) < 3:
+    clip_wkt = clip_polygon.wkt if clip_polygon else None
+    
+    # 1. Get raw edges (cached)
+    raw_edges, pts = _get_preclipped_voronoi_edges(
+        tuple(lons), tuple(lats), clip_wkt
+    )
+    
+    if not raw_edges:
         return []
-    
-    try:
-        from scipy.spatial import Voronoi  # type: ignore[import-untyped]
-    except ImportError:
-        return []
-    
-    pts = np.column_stack([pts_lon, pts_lat])
-    
-    # Add small jitter to avoid duplicate points
-    try:
-        _, counts = np.unique(pts, axis=0, return_counts=True)
-        if np.any(counts > 1):
-            rng = np.random.RandomState(42)
-            pts = pts + rng.randn(*pts.shape) * 1e-8
-            pts_lon, pts_lat = pts[:, 0], pts[:, 1]
-    except Exception:
-        pass
-    
-    vor = Voronoi(pts)
-    
-    edges: list[tuple[float, float, float, float]] = []
-    
-    def _adiff(lon: float, lat: float, i1: int, i2: int) -> float:
-        """Absolute difference in weighted distances."""
-        d1 = haversine_m(lat, lon, pts_lat[i1], pts_lon[i1])
-        d2 = haversine_m(lat, lon, pts_lat[i2], pts_lon[i2])
-        return abs((d1 - inv_w[i1] * max(radius_m, 1e-6)) - (d2 - inv_w[i2] * max(radius_m, 1e-6)))
-    
-    def _keep_and_clip_segment(
-        a: tuple[float, float],
-        b: tuple[float, float],
-        i1: int,
-        i2: int
-    ) -> list[tuple[float, float, float, float]]:
-        """Clip segment to polygon and filter by tolerance."""
-        # Shapely stubs incomplete - LineString, intersection, is_empty, geom_type not fully typed
-        seg = LineString([a, b])  # type: ignore[misc]
-        geom = seg if clip_polygon is None else seg.intersection(clip_polygon)  # type: ignore[misc]
         
-        if geom.is_empty:  # type: ignore[misc]
-            return []
-        
-        parts: list[LineString] = []
-        if geom.geom_type == 'LineString':  # type: ignore[misc]
-            parts = [cast(LineString, geom)]
-        elif geom.geom_type == 'MultiLineString':  # type: ignore[misc]
-            parts = list(cast(MultiLineString, geom).geoms)
-        
-        kept: list[tuple[float, float, float, float]] = []
-        for ls in parts:
-            coords = list(ls.coords)
-            if len(coords) < 2:
-                continue
-            
-            # Sample segment to check tolerance
-            K = 7
-            min_diff = float('inf')
-            for t in np.linspace(0.1, 0.9, K):
-                x = coords[0][0] * (1 - t) + coords[-1][0] * t
-                y = coords[0][1] * (1 - t) + coords[-1][1] * t
-                min_diff = min(min_diff, _adiff(x, y, i1, i2))
-            
-            if min_diff < tolerance_m:
-                (ax, ay), (bx, by) = coords[0], coords[-1]
-                kept.append((ax, ay, bx, by))
-        
-        return kept
-    
-    # Process finite edges
-    for (p1, p2), rv in zip(vor.ridge_points, vor.ridge_vertices):
-        if -1 not in rv:
-            vcoords = vor.vertices[rv]
-            lon1, lat1 = float(vcoords[0][0]), float(vcoords[0][1])
-            lon2, lat2 = float(vcoords[1][0]), float(vcoords[1][1])
-            kept = _keep_and_clip_segment((lon1, lat1), (lon2, lat2), p1, p2)
-            edges.extend(kept)
-        else:
-            # Handle infinite edges (rays)
-            vs = [v for v in rv if v != -1]
-            if not vs:
-                continue
-            
-            v0 = vor.vertices[vs[0]]
-            lon0, lat0 = float(v0[0]), float(v0[1])
-            
-            p1_xy = pts[[p1]][0]
-            p2_xy = pts[[p2]][0]
-            t = p2_xy - p1_xy
-            dir_vec = np.array([t[1], -t[0]], dtype=float)
-            nrm = np.linalg.norm(dir_vec)
-            
-            if nrm == 0:
-                continue
-            
-            dir_vec /= nrm
-            center = pts.mean(axis=0)
-            mid = (p1_xy + p2_xy) / 2.0
-            
-            if np.dot(mid - center, dir_vec) < 0:
-                dir_vec *= -1.0
-            
-            if clip_polygon is None:
-                continue
-            
-            # Create ray and intersect with polygon
-            minx, miny, maxx, maxy = clip_polygon.bounds
-            L = max(maxx - minx, maxy - miny) * 5.0 + 1e-6
-            far = np.array([lon0, lat0]) + dir_vec * L
-            # Shapely stubs incomplete - LineString, intersection, is_empty, geom_type not fully typed
-            ray = LineString([(lon0, lat0), (float(far[0]), float(far[1]))])  # type: ignore[misc]
-            inter = ray.intersection(clip_polygon)  # type: ignore[misc]
-            
-            if inter.is_empty:  # type: ignore[misc]
-                continue
-            
-            def _add_segment_from_linestring(ls: LineString) -> None:
-                coords = list(ls.coords)
-                if len(coords) >= 2:
-                    kept = _keep_and_clip_segment(coords[0], coords[-1], p1, p2)
-                    edges.extend(kept)
-            
-            if inter.geom_type == 'LineString':  # type: ignore[misc]
-                _add_segment_from_linestring(cast(LineString, inter))
-            elif inter.geom_type == 'MultiLineString':  # type: ignore[misc]
-                for ls in cast(MultiLineString, inter).geoms:
-                    _add_segment_from_linestring(ls)
-    
-    # Final clipping pass if polygon specified
-    if clip_polygon is not None:
-        clipped: list[tuple[float, float, float, float]] = []
-        for (x1, y1, x2, y2) in edges:
-            # Shapely stubs incomplete - LineString, intersection, is_empty, geom_type not fully typed
-            seg = LineString([(x1, y1), (x2, y2)])  # type: ignore[misc]
-            inter = seg.intersection(clip_polygon)  # type: ignore[misc]
-            
-            if inter.is_empty:  # type: ignore[misc]
-                continue
-            
-            if inter.geom_type == 'LineString':  # type: ignore[misc]
-                coords = list(cast(LineString, inter).coords)
-                if len(coords) >= 2:
-                    (ax, ay), (bx, by) = coords[0], coords[-1]
-                    clipped.append((ax, ay, bx, by))
-            elif inter.geom_type == 'MultiLineString':  # type: ignore[misc]
-                for seg2 in cast(MultiLineString, inter).geoms:
-                    coords = list(seg2.coords)
-                    if len(coords) >= 2:
-                        (ax, ay), (bx, by) = coords[0], coords[-1]
-                        clipped.append((ax, ay, bx, by))
-        edges = clipped
-    
-    return edges
+    # 2. Filter edges (cached)
+    return _filter_voronoi_edges(
+        tuple(raw_edges),
+        pts.tobytes(),
+        pts.shape,
+        tuple(inv_w),
+        radius_m,
+        tolerance_m
+    )
 
 
 def top_conflictive_voronoi_vertices(

@@ -1852,7 +1852,7 @@ else:  # Simulator
             # AP points (excluding new simulated APs)
             existing_aps = uab_df_sim[~uab_df_sim['name'].str.startswith('AP-NEW-SIM')]
             if not existing_aps.empty:
-                        fig_sim.add_trace(go.Scattermap(
+                fig_sim.add_trace(go.Scattermapbox(
                     lat=existing_aps['lat'], lon=existing_aps['lon'], mode='markers',
                     marker=dict(size=7, color='black', opacity=0.7),
                     text=existing_aps['name'], name="UAB APs",
