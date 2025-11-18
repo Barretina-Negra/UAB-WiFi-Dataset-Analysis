@@ -284,6 +284,54 @@ def _get_geojson_features(
     return features, ids
 
 
+def compute_coverage_regions(
+    df_uab: pd.DataFrame,
+    *,
+    tile_meters: float = 7.0,
+    radius_m: float = 25.0,
+    max_tiles: int = 40000
+) -> list[Polygon]:
+    """
+    Compute coverage regions (tiles) where distance to nearest AP < radius_m.
+    Uses cached grid geometry and distances for performance.
+    """
+    if df_uab.empty:
+        return []
+        
+    # Sort for determinism
+    df_sorted = df_uab.sort_values(["lon", "lat"])
+    lons = df_sorted["lon"].to_numpy(dtype=float)
+    lats = df_sorted["lat"].to_numpy(dtype=float)
+    
+    # Use cached geometry
+    centers_in, dlon, dlat, hull_poly, _ = _compute_grid_geometry(
+        tuple(lons), tuple(lats), tile_meters, max_tiles
+    )
+    
+    if hull_poly is None or centers_in.size == 0:
+        return []
+        
+    # Use cached distances
+    dists = _compute_grid_distances(
+        centers_in.tobytes(), centers_in.shape, tuple(lons), tuple(lats)
+    )
+    
+    d_min = dists.min(axis=1)
+    covered_mask = d_min < radius_m
+    covered_centers = centers_in[covered_mask]
+    
+    if covered_centers.size == 0:
+        return []
+        
+    tile_polys = []
+    for (cx, cy) in covered_centers:
+        lon0, lon1 = cx - dlon/2, cx + dlon/2
+        lat0, lat1 = cy - dlat/2, cy + dlat/2
+        tile_polys.append(Polygon([(lon0, lat0), (lon1, lat0), (lon1, lat1), (lon0, lat1)]))
+        
+    return tile_polys
+
+
 def uab_tiled_choropleth_layer(
     df_uab: pd.DataFrame,
     *,

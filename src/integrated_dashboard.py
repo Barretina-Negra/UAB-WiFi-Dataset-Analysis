@@ -427,6 +427,7 @@ from dashboard.voronoi_viz import (
     inverted_weighted_voronoi_edges as _inverted_weighted_voronoi_edges,
     top_conflictive_voronoi_vertices as _top_conflictive_voronoi_vertices,
     uab_tiled_choropleth_layer as _uab_tiled_choropleth_layer,
+    compute_coverage_regions as _compute_coverage_regions,
 )
 
 # ======== SIMULATOR MODE FUNCTIONS (from simulator_viz module) ========
@@ -562,50 +563,7 @@ def _snap_and_connect_edges(segments: list, clip_polygon: Polygon,
     except Exception:
         return None
 
-def _coverage_regions_from_uab_tiles(uab_df: pd.DataFrame, tile_meters: float, radius_m: float,
-                                     max_tiles: int = 40000) -> list:
-    """Approximate coverage regions using tiling logic."""
-    if uab_df.empty:
-        return []
-    lons = uab_df["lon"].to_numpy(float)
-    lats = uab_df["lat"].to_numpy(float)
-    hull = _compute_convex_hull_polygon(lons, lats)
-    if hull is None:
-        return []
-    lat0 = float(np.mean(lats)) if len(lats) else 41.5
-    meters_per_deg_lat = 111_320.0
-    meters_per_deg_lon = 111_320.0 * np.cos(np.deg2rad(lat0))
-    dlat = tile_meters / meters_per_deg_lat
-    dlon = tile_meters / max(meters_per_deg_lon, 1e-6)
-    minx, miny, maxx, maxy = hull.bounds
-    lon_centers = np.arange(minx + dlon/2, maxx, dlon)
-    lat_centers = np.arange(miny + dlat/2, maxy, dlat)
-    XX, YY = np.meshgrid(lon_centers, lat_centers)
-    centers = np.column_stack([XX.ravel(), YY.ravel()])
-    poly_path = MplPath(np.vstack(hull.exterior.coords.xy).T)
-    inside = poly_path.contains_points(centers)
-    centers_in = centers[inside]
-    if centers_in.size == 0:
-        return []
-    dists = _haversine_m(centers_in[:,1][:,None], centers_in[:,0][:,None], lats[None,:], lons[None,:])
-    d_min = dists.min(axis=1)
-    covered_mask = d_min < radius_m
-    covered_centers = centers_in[covered_mask]
-    if covered_centers.size == 0:
-        return []
-    tile_polys = []
-    for (cx, cy) in covered_centers:
-        lon0, lon1 = cx - dlon/2, cx + dlon/2
-        lat0, lat1 = cy - dlat/2, cy + dlat/2
-        tile_polys.append(Polygon([(lon0, lat0), (lon1, lat0), (lon1, lat1), (lon0, lat1)]))
-    merged = unary_union(tile_polys)
-    polys = []
-    if merged.geom_type == 'Polygon':
-        polys = [merged]
-    elif merged.geom_type == 'MultiPolygon':
-        polys = list(merged.geoms)
-    final_polys = [p for p in polys if p.area > 0]
-    return final_polys
+
 
 # -------- UI --------
 st.set_page_config(page_title="UAB Wi‑Fi Integrated Dashboard", page_icon="📶", layout="wide")
@@ -1241,7 +1199,7 @@ elif viz_mode == "Voronoi":
         aw_df = map_df[map_df["group_code"] != "SAB"].copy()
         base_col = weight_source if weight_source in aw_df.columns else "conflictivity"
         if not aw_df.empty and base_col in aw_df.columns:
-            regions = _coverage_regions_from_uab_tiles(
+            regions = _compute_coverage_regions(
                 aw_df,
                 tile_meters=float(TILE_M_FIXED),
                 radius_m=radius_m,
