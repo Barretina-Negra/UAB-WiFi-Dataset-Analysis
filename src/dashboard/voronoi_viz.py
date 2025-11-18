@@ -319,7 +319,7 @@ def uab_tiled_choropleth_layer(
     geojson = {"type": "FeatureCollection", "features": features}
     
     colorbar_title = "Connectivity" if value_mode == "connectivity" else "Conflictivity"
-    ch = go.Choroplethmapbox(  # type: ignore[misc]
+    ch = go.Choroplethmap(  # type: ignore[misc]
         geojson=geojson,
         locations=ids,
         z=z_pred,

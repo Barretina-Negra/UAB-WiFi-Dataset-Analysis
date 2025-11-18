@@ -102,7 +102,8 @@ def read_ap_snapshot(path: Path, band_mode: str = "worst") -> pd.DataFrame:
             valid = [value for value in [max_2g, max_5g] if not np.isnan(value)]
             agg_util = float(np.mean(valid)) if valid else np.nan
         else:
-            agg_util = np.nanmax([max_2g, max_5g])
+            pair = np.array([max_2g, max_5g], dtype=float)
+            agg_util = float(np.nanmax(pair)) if not np.isnan(pair).all() else np.nan
 
         rows.append(
             {
