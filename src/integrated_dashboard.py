@@ -189,6 +189,86 @@ except Exception:
     has_scipy_voronoi = False
 
 
+class DashboardMode(Enum):
+    AI_HEATMAP = "ai-heatmap"
+    VORONOI = "voronoi"
+    SIMULATOR = "simulator"
+
+    @classmethod
+    def label_map(cls) -> dict[str, str]:
+        return {
+            cls.AI_HEATMAP.value: "AI Heatmap",
+            cls.VORONOI.value: "Voronoi",
+            cls.SIMULATOR.value: "Simulator",
+        }
+
+
+def _mode_to_slug(mode: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "-", mode.lower()).strip("-")
+    labels = DashboardMode.label_map()
+    for slug, label in labels.items():
+        if normalized == slug or mode == label:
+            return slug
+    if normalized == "ai-heatmap":
+        return DashboardMode.AI_HEATMAP.value
+    return normalized or DashboardMode.AI_HEATMAP.value
+
+
+def _slug_to_label(slug: str, available_modes: list[str]) -> str | None:
+    if not slug:
+        return None
+    normalized = re.sub(r"[^a-z0-9]+", "-", slug.lower()).strip("-")
+    labels = DashboardMode.label_map()
+    label = labels.get(normalized)
+    if label and label in available_modes:
+        return label
+    for candidate in available_modes:
+        candidate_slug = re.sub(r"[^a-z0-9]+", "-", candidate.lower()).strip("-")
+        if candidate_slug == normalized:
+            return candidate
+    return None
+
+
+def _get_query_param_value(key: str) -> str | None:
+    raw_value = st.query_params.get(key)
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, list):
+        return raw_value[0] if raw_value else None
+    return str(raw_value)
+
+
+def _set_query_param_value(key: str, value: str) -> None:
+    current_params = {k: v for k, v in st.query_params.items()}
+    if current_params.get(key) == value:
+        return
+    current_params[key] = value
+    st.query_params = current_params
+
+
+def resolve_dashboard_mode(
+    *,
+    available_modes: list[str],
+    simulator_enabled: bool,
+) -> str:
+    assert available_modes, "available_modes must not be empty"
+    query_choice = _get_query_param_value("dashboard")
+    env_choice = os.getenv("dashboard") or os.getenv("DASHBOARD")
+    preferred_order = [query_choice, env_choice]
+    for preferred in preferred_order:
+        if preferred is None:
+            continue
+        label = _slug_to_label(preferred, available_modes)
+        if label:
+            if label == "Simulator" and not simulator_enabled:
+                continue
+            return label
+    fallback = "AI Heatmap"
+    if fallback not in available_modes:
+        return available_modes[0]
+    return fallback
+
+
 def resolve_stress_profiles(
     target: Any,  # StressLevel or None
     stats: Dict[Any, Dict[str, float]],  # Dict[StressLevel, Dict[str, float]]
@@ -548,24 +628,33 @@ if not snapshots:
 geo_df = read_geoloc_points(GEOJSON_PATH)
 
 # Sidebar
+mode_options = ["AI Heatmap", "Voronoi"]
+if simulator_available:
+    mode_options.append("Simulator")
+default_mode = resolve_dashboard_mode(
+    available_modes=mode_options,
+    simulator_enabled=simulator_available,
+)
+if "selected_dashboard" not in st.session_state:
+    st.session_state.selected_dashboard = default_mode
+expected_slug = _mode_to_slug(st.session_state.selected_dashboard)
+current_slug = _get_query_param_value("dashboard")
+if current_slug != expected_slug:
+    _set_query_param_value("dashboard", expected_slug)
 with st.sidebar:
     st.header("Visualization Mode")
     
-    # Show Simulator option only if simulator module is available
-    if simulator_available:
-        viz_mode = st.radio(
-            "Select Mode",
-            options=["AI Heatmap", "Voronoi", "Simulator"],
-            index=0,
-            help="AI Heatmap: Click APs for AINA analysis | Voronoi: Interpolated surfaces | Simulator: AP placement optimization"
-        )
-    else:
-        viz_mode = st.radio(
-            "Select Mode",
-            options=["AI Heatmap", "Voronoi"],
-            index=0,
-            help="AI Heatmap: Click APs for AINA analysis | Voronoi: Interpolated surfaces with connectivity"
-        )
+    current_index = mode_options.index(st.session_state.selected_dashboard)
+    viz_mode = st.radio(
+        "Select Mode",
+        options=mode_options,
+        index=current_index,
+        help="AI Heatmap: Click APs for AINA analysis | Voronoi: Interpolated surfaces | Simulator: AP placement optimization",
+        key="viz_mode_radio",
+    )
+    if viz_mode != st.session_state.selected_dashboard:
+        st.session_state.selected_dashboard = viz_mode
+        _set_query_param_value("dashboard", _mode_to_slug(viz_mode))
     
     st.divider()
     st.header("Time Navigation")
@@ -1086,8 +1175,8 @@ if viz_mode == "AI Heatmap":
 
     fig.update_layout(clickmode='event+select')
     selected_points = st.plotly_chart(
-        fig, 
-        use_container_width=True, 
+        fig,
+        width="stretch",
         on_select="rerun",
         key=f"ap_map_{st.session_state.chart_refresh_key}"
     )
@@ -1139,7 +1228,7 @@ elif viz_mode == "Voronoi":
                              x=0.02, y=0.98, bgcolor="rgba(255,255,255,0.8)", bordercolor="#888", font=dict(size=10))
         
         # AP points
-        fig.add_trace(go.Scattermapbox(
+        fig.add_trace(go.Scattermap(
             lat=uab_df['lat'], lon=uab_df['lon'], mode='markers',
             marker=dict(size=7, color='black', opacity=0.7),
             text=uab_df['name'], name="UAB APs",
@@ -1209,7 +1298,7 @@ elif viz_mode == "Voronoi":
                 elif merged_lines.geom_type == 'MultiLineString':
                     for ls in merged_lines.geoms:
                         add_lines(ls)
-                fig.add_trace(go.Scattermapbox(
+                fig.add_trace(go.Scattermap(
                     lon=lons,
                     lat=lats,
                     mode='lines',
@@ -1228,12 +1317,12 @@ elif viz_mode == "Voronoi":
                         ]
                         # Marker #1
                         hv_lon, hv_lat, hv_score = topv[0]
-                        fig.add_trace(go.Scattermapbox(
+                        fig.add_trace(go.Scattermap(
                             lon=[hv_lon], lat=[hv_lat], mode='markers',
                             marker=dict(size=24, color='#ffffff', symbol='circle', opacity=0.95),
                             hoverinfo='skip', showlegend=False
                         ))
-                        fig.add_trace(go.Scattermapbox(
+                        fig.add_trace(go.Scattermap(
                             lon=[hv_lon], lat=[hv_lat], mode='markers+text',
                             marker=dict(
                                 size=18,
@@ -1253,12 +1342,12 @@ elif viz_mode == "Voronoi":
                             lats = [t[1] for t in topv[1:]]
                             scores = [float(t[2]) for t in topv[1:]]
                             labels = [f"#{i+2}" for i in range(len(lons))]
-                            fig.add_trace(go.Scattermapbox(
+                            fig.add_trace(go.Scattermap(
                                 lon=lons, lat=lats, mode='markers',
                                 marker=dict(size=20, color='#ffffff', symbol='circle', opacity=0.95),
                                 hoverinfo='skip', showlegend=False
                             ))
-                            fig.add_trace(go.Scattermapbox(
+                            fig.add_trace(go.Scattermap(
                                 lon=lons, lat=lats, mode='markers+text',
                                 marker=dict(
                                     size=16,
@@ -1287,7 +1376,7 @@ elif viz_mode == "Voronoi":
                         hull_lons.extend(list(xi) + [None])
                         hull_lats.extend(list(yi) + [None])
                 if hull_lons:
-                    fig.add_trace(go.Scattermapbox(
+                    fig.add_trace(go.Scattermap(
                         lon=hull_lons,
                         lat=hull_lats,
                         mode='lines',
@@ -1300,7 +1389,7 @@ elif viz_mode == "Voronoi":
                                  showarrow=False, bgcolor="rgba(0,0,0,0.4)", font=dict(color='white', size=10))
 
     fig.update_layout(
-        mapbox=dict(
+        map=dict(
             style="open-street-map",
             center=dict(lat=center_lat, lon=center_lon),
             zoom=15,
@@ -1310,7 +1399,7 @@ elif viz_mode == "Voronoi":
         legend=dict(orientation="h", yanchor="bottom", y=0.02, xanchor="left", x=0.02)
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     # Table with top hotspot vertices
     try:
@@ -1318,7 +1407,7 @@ elif viz_mode == "Voronoi":
             st.subheader("Top vertices Voronoi més conflictius")
             top_df = pd.DataFrame(hot_vertices_info)
             top_df["score"] = top_df["score"].map(lambda x: f"{x:.3f}")
-            st.dataframe(top_df, use_container_width=True, hide_index=True)
+            st.dataframe(top_df, width="stretch", hide_index=True)
     except Exception:
         pass
 
@@ -1346,7 +1435,7 @@ else:  # Simulator
                              x=0.02, y=0.98, bgcolor="rgba(255,255,255,0.8)", bordercolor="#888", font=dict(size=10))
         
         # AP points
-        fig.add_trace(go.Scattermapbox(
+        fig.add_trace(go.Scattermap(
             lat=uab_df['lat'], lon=uab_df['lon'], mode='markers',
             marker=dict(size=7, color='black', opacity=0.7),
             text=uab_df['name'], name="UAB APs",
@@ -1357,7 +1446,7 @@ else:  # Simulator
     # Overlay Voronoi candidate markers if discovered
     if 'voronoi_candidates' in st.session_state and not st.session_state.voronoi_candidates.empty:
         vor_df = st.session_state.voronoi_candidates
-        fig.add_trace(go.Scattermapbox(
+        fig.add_trace(go.Scattermap(
             lat=vor_df['lat'],
             lon=vor_df['lon'],
             mode='markers+text',
@@ -1571,7 +1660,7 @@ else:  # Simulator
                             
                             if len(results_df) > 0:
                                 best = results_df.iloc[0]
-                                fig.add_trace(go.Scattermapbox(
+                                fig.add_trace(go.Scattermap(
                                     lat=[best['lat']],
                                     lon=[best['lon']],
                                     mode='markers',
@@ -1603,7 +1692,7 @@ else:  # Simulator
                             for idx, row in results_df.iterrows():
                                 rank = idx + 1
                                 
-                                fig.add_trace(go.Scattermapbox(
+                                fig.add_trace(go.Scattermap(
                                     lat=[row['lat']],
                                     lon=[row['lon']],
                                     mode='markers+text',
@@ -1654,7 +1743,7 @@ else:  # Simulator
                                     'New AP Clients': '{:.0f}',
                                     'Scenarios': '{:.0f}',
                                 }).background_gradient(subset=['Final Score'], cmap='RdYlGn'),
-                                use_container_width=True
+                                width="stretch"
                             )
                             
                             col1, col2, col3, col4 = st.columns(4)
@@ -1722,7 +1811,7 @@ else:  # Simulator
         st.session_state.run_sim = False
 
     fig.update_layout(
-        mapbox=dict(
+        map=dict(
             style="open-street-map",
             center=dict(lat=center_lat, lon=center_lon),
             zoom=15,
@@ -1732,7 +1821,7 @@ else:  # Simulator
         legend=dict(orientation="h", yanchor="bottom", y=0.02, xanchor="left", x=0.02)
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     
     # Render a second map with the simulated surface, if available
     if 'map_override_df' in st.session_state and st.session_state['map_override_df'] is not None:
@@ -1763,7 +1852,7 @@ else:  # Simulator
             # AP points (excluding new simulated APs)
             existing_aps = uab_df_sim[~uab_df_sim['name'].str.startswith('AP-NEW-SIM')]
             if not existing_aps.empty:
-                fig_sim.add_trace(go.Scattermapbox(
+                        fig_sim.add_trace(go.Scattermap(
                     lat=existing_aps['lat'], lon=existing_aps['lon'], mode='markers',
                     marker=dict(size=7, color='black', opacity=0.7),
                     text=existing_aps['name'], name="UAB APs",
@@ -1774,7 +1863,7 @@ else:  # Simulator
         # Add new AP markers if available
         if 'new_node_markers' in st.session_state and st.session_state['new_node_markers']:
             nn = st.session_state['new_node_markers']
-            fig_sim.add_trace(go.Scattermapbox(
+            fig_sim.add_trace(go.Scattermap(
                 lat=[p['lat'] for p in nn],
                 lon=[p['lon'] for p in nn],
                 mode='markers+text',
@@ -1785,7 +1874,7 @@ else:  # Simulator
             ))
         
         fig_sim.update_layout(
-            mapbox=dict(
+            map=dict(
                 style="open-street-map",
                 center=dict(lat=center_lat, lon=center_lon),
                 zoom=15,
@@ -1796,7 +1885,7 @@ else:  # Simulator
         )
         
         st.subheader("Simulated Map (with new APs)")
-        st.plotly_chart(fig_sim, use_container_width=True)
+        st.plotly_chart(fig_sim, width="stretch")
     
     # Display Voronoi Candidates table if detected
     if 'voronoi_candidates' in st.session_state and not st.session_state.voronoi_candidates.empty:
@@ -1814,7 +1903,7 @@ else:  # Simulator
         
         edited = st.data_editor(
             display_vor,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             disabled={
                 'Latitude': True,
@@ -1947,7 +2036,7 @@ else:  # Simulator
                         'new_ap_client_count_mean': '{:.1f}',
                         'n_scenarios': '{:.0f}',
                     }).background_gradient(subset=['final_score'], cmap='RdYlGn'),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True
                 )
         
@@ -1976,7 +2065,7 @@ else:
         )
     )
     top_df["Conflictivity Score"] = top_df["Conflictivity Score"].map(lambda x: f"{x:.3f}")
-    st.dataframe(top_df, use_container_width=True, hide_index=True)
+    st.dataframe(top_df, width="stretch", hide_index=True)
 
 band_info = {
     "worst": "Worst band (max of 2.4/5 GHz)",
