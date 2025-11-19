@@ -20,6 +20,10 @@ Run
 """
 
 from __future__ import annotations
+import time
+import sys
+_profile_start = time.perf_counter()
+print(f"[PROFILE] Script Start: {_profile_start}", file=sys.stderr)
 
 import math
 import re
@@ -61,6 +65,12 @@ from dashboard.types import (
     W_MEM,
 )
 
+def _log_profile(msg):
+    if "_profile_start" in globals():
+        print(f"[PROFILE] {time.perf_counter() - _profile_start:.4f}s: {msg}", file=sys.stderr)
+
+_log_profile("Imports Complete")
+
 SRC_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = SRC_ROOT.parent
 
@@ -71,6 +81,7 @@ if str(REPO_ROOT) not in sys.path:
 
 # Load environment variables
 load_dotenv()
+_log_profile("Env Loaded")
 
 from dashboard.data_io import (
     AP_DIR,
@@ -80,6 +91,7 @@ from dashboard.data_io import (
     read_ap_snapshot as load_ap_snapshot,
     read_geoloc_points,
 )
+_log_profile("Data IO Imports Complete")
 
 if TYPE_CHECKING:
     pass
@@ -230,6 +242,11 @@ def _slug_to_label(slug: str, available_modes: list[str]) -> str | None:
 
 
 def _get_query_param_value(key: str) -> str | None:
+    # Check environment variable first for profiling/headless mode
+    env_val = os.environ.get(key)
+    if env_val:
+        return env_val
+        
     raw_value = st.query_params.get(key)
     if raw_value is None:
         return None
@@ -263,10 +280,8 @@ def resolve_dashboard_mode(
             if label == "Simulator" and not simulator_enabled:
                 continue
             return label
-    fallback = "AI Heatmap"
-    if fallback not in available_modes:
-        return available_modes[0]
-    return fallback
+    
+    return available_modes[0]
 
 
 def resolve_stress_profiles(
@@ -579,11 +594,13 @@ if not GEOJSON_PATH.exists():
     st.stop()
 
 snapshots = find_snapshot_files(AP_DIR)
+_log_profile("Snapshots Found")
 if not snapshots:
     st.warning("No AP snapshots found in realData/ap. Please add AP-info-v2-*.json files.")
     st.stop()
 
 geo_df = read_geoloc_points(GEOJSON_PATH)
+_log_profile("GeoJSON Loaded")
 
 # Sidebar
 mode_options = ["AI Heatmap", "Voronoi"]
@@ -1011,7 +1028,7 @@ Entrades per AP
 
 - band_mode="worst" (per defecte): airtime_score = max(airtime_2g, airtime_5g)
 
-- band_mode="avg": mitjana ponderada (2,4 GHz 0,6, 5 GHz 0,4)
+- band_mode="avg": mitjana ponderada (2,4 GHz 0,6, 5 GHz 0:40%)
 
 - band_mode="2.4GHz"/"5GHz": prendre la puntuació d'aquesta banda
 
@@ -1250,7 +1267,7 @@ elif viz_mode == "Voronoi":
                             lons.append(x)
                             lats.append(y)
                         lons.append(None)
-                        lats.append(None)
+                        lats.appen(None)
                 if merged_lines.geom_type == 'LineString':
                     add_lines(merged_lines)
                 elif merged_lines.geom_type == 'MultiLineString':
@@ -1709,6 +1726,7 @@ else:  # Simulator
                             
                             with col1:
                                 st.metric("Best Score", f"{best['final_score']:.3f}", 
+ 
                                          delta=f"±{best['score_std']:.3f}")
                             with col2:
                                 st.metric("Avg Reduction", f"{best['avg_reduction_raw_mean']:.3f}")
@@ -2027,10 +2045,12 @@ else:
 
 band_info = {
     "worst": "Worst band (max of 2.4/5 GHz)",
-    "avg": "Weighted average of band maxima (2.4:60%, 5:40%)",
+    "avg": "Weighted average of band maxima (2.4:60%, 5 GHz 0:40%)",
     "2.4GHz": "2.4 GHz only",
     "5GHz": "5 GHz only",
 }
+
+_log_profile("Script Execution Complete")
 
 if viz_mode == "AI Heatmap":
     st.caption(
