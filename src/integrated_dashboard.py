@@ -1382,7 +1382,7 @@ elif viz_mode == "Voronoi":
             center=dict(lat=center_lat, lon=center_lon),
             zoom=15,
         ),
-        margin=dict(l=10, r=10, t=30, b=10),
+        margin=dict(l=10, r=10, t=30, b=80),
         height=700,
         legend=dict(orientation="h", yanchor="bottom", y=0.02, xanchor="left", x=0.02)
     )
@@ -1805,7 +1805,7 @@ else:  # Simulator
             center=dict(lat=center_lat, lon=center_lon),
             zoom=15,
         ),
-        margin=dict(l=10, r=10, t=30, b=10),
+        margin=dict(l=10, r=10, t=30, b=80),
         height=700,
         legend=dict(orientation="h", yanchor="bottom", y=0.02, xanchor="left", x=0.02)
     )
@@ -1868,7 +1868,7 @@ else:  # Simulator
                 center=dict(lat=center_lat, lon=center_lon),
                 zoom=15,
             ),
-            margin=dict(l=10, r=10, t=30, b=10),
+            margin=dict(l=10, r=10, t=30, b=80),
             height=700,
             legend=dict(orientation="h", yanchor="bottom", y=0.02, xanchor="left", x=0.02)
         )

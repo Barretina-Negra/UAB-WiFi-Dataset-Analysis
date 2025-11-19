@@ -290,6 +290,8 @@ def create_optimized_heatmap(
                 "showscale": True,
                 "colorbar": {
                     "title": "Conflictivity",
+                    "orientation": "h",
+                    "y": -0.1,
                     "thickness": 15,
                     "len": 0.7,
                     "tickmode": "linear",
@@ -312,7 +314,7 @@ def create_optimized_heatmap(
             "center": {"lat": center_lat, "lon": center_lon},
             "zoom": config.default_zoom,
         },
-        margin={"l": 10, "r": 10, "t": 30, "b": 10},
+        margin={"l": 10, "r": 10, "t": 30, "b": 80},
         height=700,
     )
     
