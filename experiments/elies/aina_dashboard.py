@@ -727,7 +727,7 @@ fig.update_layout(clickmode='event+select')
 # Use chart_refresh_key to force recreation when dialog closes (clears selection)
 selected_points = st.plotly_chart(
     fig, 
-    use_container_width=True, 
+    width="stretch",
     on_select="rerun",
     key=f"ap_map_{st.session_state.chart_refresh_key}"
 )
