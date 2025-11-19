@@ -251,10 +251,13 @@ def estimate_client_distribution(
     
     total_transferred = 0
     
+    # We consider all APs in range as candidates for offloading, regardless of their current conflictivity.
+    # Clients roam based on signal strength, not the AP's stress level.
     candidates = df[df['in_range'] & (df['client_count'] > 0)].copy()
     
     if not candidates.empty:
-        candidates = candidates.sort_values('dist_to_new', ascending=True)
+        # Sort by conflictivity descending (prioritize helping stressed APs)
+        candidates = candidates.sort_values('conflictivity', ascending=False)
         
         for idx, row in candidates.iterrows():
             signal_strength = max(0.0, (row['rssi_new'] - config.min_rssi_dbm) / 20.0)
@@ -265,21 +268,36 @@ def estimate_client_distribution(
             
             conflict_factor = float(row.get('conflictivity', 0.5))
             
+            # Balanced approach: signal quality and current stress both drive migration.
             transfer_potential = (
-                0.30 * signal_strength +
-                0.30 * distance_factor +
+                0.40 * signal_strength +
+                0.20 * distance_factor +
                 0.40 * conflict_factor
             )
             
-            transfer_fraction = min(config.max_offload_fraction, transfer_potential * 0.8)
+            transfer_fraction = min(config.max_offload_fraction, transfer_potential)
             
             transfer_fraction *= (1 - config.sticky_client_fraction)
             
-            n_transfer = max(1, int(row['client_count'] * transfer_fraction))
+            # Use round() instead of int() to handle small client counts better
+            n_transfer = int(round(row['client_count'] * transfer_fraction))
             
             n_transfer = min(n_transfer, int(row['client_count']))
             
             if n_transfer > 0:
+                # Reduce utilization proportionally to client loss
+                fraction_removed = n_transfer / row['client_count']
+                
+                # Update 2G
+                current_2g = row['util_2g'] if not pd.isna(row['util_2g']) else 0.0
+                new_2g = max(5.0, current_2g * (1 - fraction_removed))
+                df.at[idx, 'util_2g'] = new_2g
+                
+                # Update 5G
+                current_5g = row['util_5g'] if not pd.isna(row['util_5g']) else 0.0
+                new_5g = max(5.0, current_5g * (1 - fraction_removed))
+                df.at[idx, 'util_5g'] = new_5g
+
                 df.at[idx, 'client_count'] = max(0, row['client_count'] - n_transfer)
                 total_transferred += n_transfer
     
@@ -336,12 +354,16 @@ def apply_cca_interference(
         0.0
     )
     
+    # Apply channel overlap probabilities
+    prob_2g = getattr(config, 'channel_overlap_prob_2g', 0.33)
+    prob_5g = getattr(config, 'channel_overlap_prob_5g', 0.10)
+    
     df['util_2g'] = np.clip(
-        df['util_2g'] * (1 + increase_factor),
+        df['util_2g'] * (1 + increase_factor * prob_2g),
         0.0, 100.0
     )
     df['util_5g'] = np.clip(
-        df['util_5g'] * (1 + increase_factor),
+        df['util_5g'] * (1 + increase_factor * prob_5g),
         0.0, 100.0
     )
     

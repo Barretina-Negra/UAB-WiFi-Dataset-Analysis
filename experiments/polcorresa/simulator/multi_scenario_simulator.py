@@ -120,7 +120,9 @@ class MultiScenarioSimulator:
         
         # Hybrid redistribution
         total_transferred = 0
-        candidates = df[df['in_range'] & (df['conflictivity'] > 0.5)].copy()
+        # We consider all APs in range as candidates for offloading, regardless of their current conflictivity.
+        # Clients roam based on signal strength, not the AP's stress level.
+        candidates = df[df['in_range']].copy()
         candidates = candidates.sort_values('conflictivity', ascending=False)
         
         for idx, row in candidates.iterrows():
@@ -132,15 +134,35 @@ class MultiScenarioSimulator:
             conflict_factor = row['conflictivity']
             
             # Combined transfer fraction
+            # Balanced approach: signal quality and current stress both drive migration.
             transfer_fraction = min(
                 self.config.max_offload_fraction,
-                0.3 * rssi_factor + 0.4 * conflict_factor
+                0.4 * rssi_factor + 0.4 * conflict_factor
             )
             
             # Apply sticky client constraint
             transfer_fraction *= (1 - self.config.sticky_client_fraction)
             
-            n_transfer = int(row['client_count'] * transfer_fraction)
+            # Use round() instead of int() to handle small client counts better
+            n_transfer = int(round(row['client_count'] * transfer_fraction))
+            
+            # Reduce utilization proportionally to client loss
+            if row['client_count'] > 0 and n_transfer > 0:
+                fraction_removed = n_transfer / row['client_count']
+                # Assume utilization is roughly proportional to clients
+                # We clamp the reduction to avoid going below 0
+                # We also assume some baseline utilization (e.g. 5%) that doesn't go away
+                
+                # Update 2G
+                current_2g = row['util_2g'] if not pd.isna(row['util_2g']) else 0.0
+                new_2g = max(5.0, current_2g * (1 - fraction_removed))
+                df.at[idx, 'util_2g'] = new_2g
+                
+                # Update 5G
+                current_5g = row['util_5g'] if not pd.isna(row['util_5g']) else 0.0
+                new_5g = max(5.0, current_5g * (1 - fraction_removed))
+                df.at[idx, 'util_5g'] = new_5g
+                
             df.at[idx, 'client_count'] -= n_transfer
             total_transferred += n_transfer
         
@@ -185,24 +207,28 @@ class MultiScenarioSimulator:
         in_interference_range = distances <= self.config.interference_radius_m
         
         # Distance-weighted increase
-        increase_factor = np.where(
+        # We also apply a probability factor for channel overlap.
+        # Not all neighbors are on the same channel.
+        base_increase = np.where(
             in_interference_range,
             self.config.cca_increase_factor * (1 - distances / self.config.interference_radius_m),
             0.0
         )
         
-        # Apply to both bands
+        # Apply to both bands with respective overlap probabilities
         df['util_2g'] = np.clip(
-            df['util_2g'] * (1 + increase_factor),
+            df['util_2g'] * (1 + base_increase * self.config.channel_overlap_prob_2g),
             0.0, 100.0
         )
         df['util_5g'] = np.clip(
-            df['util_5g'] * (1 + increase_factor),
+            df['util_5g'] * (1 + base_increase * self.config.channel_overlap_prob_5g),
             0.0, 100.0
         )
         
         df['agg_util'] = np.maximum(df['util_2g'], df['util_5g'])
         
+        affected_count = np.sum(in_interference_range)
+
         return df
     
     def recalculate_conflictivity(self, df: pd.DataFrame) -> pd.DataFrame:

@@ -758,13 +758,13 @@ with st.sidebar:
                 
                 with col_adv1:
                     sim_interference_radius = st.slider(
-                        "Interference radius (m)", 30, 80, 50, 5,
-                        help="How far the new AP affects neighbors (typical: 50m)"
+                        "Interference radius (m)", 10, 80, 25, 5,
+                        help="How far the new AP affects neighbors (typical: 25m)"
                     )
                     
                     sim_cca_increase = st.slider(
-                        "Co-channel interference", 0.05, 0.30, 0.15, 0.05,
-                        help="How much neighbors' utilization increases (typical: 15%)"
+                        "Co-channel interference", 0.01, 0.30, 0.02, 0.01,
+                        help="How much neighbors' utilization increases (typical: 2%)"
                     )
                 
                 with col_adv2:
@@ -796,8 +796,8 @@ with st.sidebar:
                     )
             
             if 'sim_interference_radius' not in locals():
-                sim_interference_radius = 50
-                sim_cca_increase = 0.15
+                sim_interference_radius = 25
+                sim_cca_increase = 0.02
                 w_worst, w_avg, w_cov, w_neigh = 0.30, 0.30, 0.20, 0.20
                 total_weight = 1.0
                 sim_interior_buffer_tiles = 2

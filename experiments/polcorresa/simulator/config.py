@@ -40,10 +40,22 @@ class SimulationConfig:
     Interference Parameters:
     ------------------------
     interference_radius_m : float
-        Range of co-channel interference (CCA busy) (default: 50m)
+        Range of co-channel interference (CCA busy) (default: 30m)
+        # Reduced from 50m to 30m to match typical CCA threshold (~-82dBm)
+        # with path_loss_exponent=3.5
     
     cca_increase_factor : float
-        How much new AP increases neighbor utilization (default: 0.15 = 15%)
+        How much new AP increases neighbor utilization (default: 0.05 = 5%)
+        # Reduced from 0.15 to 0.05 to account for auto-channel selection
+        # and avoid penalizing neighbors too harshly.
+    
+    channel_overlap_prob_2g : float
+        Probability that a neighbor is on the same 2.4GHz channel (default: 0.33)
+        # 1/3 chance (Channels 1, 6, 11)
+    
+    channel_overlap_prob_5g : float
+        Probability that a neighbor is on the same 5GHz channel (default: 0.10)
+        # ~1/10 chance (depending on width)
     
     Client Redistribution:
     ----------------------
@@ -119,10 +131,12 @@ class SimulationConfig:
     min_rssi_dbm: float = -75.0
     
     # Interference
-    interference_radius_m: float = 50.0
-    cca_increase_factor: float = 0.15
+    interference_radius_m: float = 25.0
+    cca_increase_factor: float = 0.02
+    channel_overlap_prob_2g: float = 0.33
+    channel_overlap_prob_5g: float = 0.10
     
-    # Client redistribution
+    # Redistribution
     max_offload_fraction: float = 0.5
     sticky_client_fraction: float = 0.3
     handover_margin_db: float = 3.0
