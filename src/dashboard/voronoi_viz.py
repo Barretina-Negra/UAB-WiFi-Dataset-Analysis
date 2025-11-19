@@ -434,7 +434,18 @@ def uab_tiled_choropleth_layer(
         marker_opacity=0.9,
         marker_line_width=0,
         showscale=True,
-        colorbar=dict(title=colorbar_title, thickness=15, len=0.7, orientation='h', y=-0.1),
+        colorbar=dict(
+            title=colorbar_title,
+            thickness=15,
+            len=0.3,
+            orientation='h',
+            x=0.95,
+            y=0.95,
+            xanchor='right',
+            yanchor='top',
+            showticklabels=False,
+            bgcolor="rgba(255,255,255,0.5)"
+        ),
         name="UAB tiles",
     )
     
