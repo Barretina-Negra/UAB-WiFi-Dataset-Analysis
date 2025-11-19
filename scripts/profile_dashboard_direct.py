@@ -82,6 +82,21 @@ class MockStreamlit:
     def query_params(self, value):
         self._query_params = value
 
+    def slider(self, label, min_value=None, max_value=None, value=None, step=None, format=None, key=None, help=None, on_change=None, args=None, kwargs=None, *, disabled=False, label_visibility="visible"):
+        return value if value is not None else min_value
+
+    def selectbox(self, label, options, index=0, format_func=None, key=None, help=None, on_change=None, args=None, kwargs=None, *, disabled=False, label_visibility="visible"):
+        return options[index]
+
+    def checkbox(self, label, value=False, key=None, help=None, on_change=None, args=None, kwargs=None, *, disabled=False, label_visibility="visible"):
+        return value
+
+    def multiselect(self, label, options, default=None, format_func=None, key=None, help=None, on_change=None, args=None, kwargs=None, *, disabled=False, label_visibility="visible", max_selections=None, placeholder="Choose an option"):
+        return default if default is not None else []
+    
+    def number_input(self, label, min_value=None, max_value=None, value=None, step=None, format=None, key=None, help=None, on_change=None, args=None, kwargs=None, *, disabled=False, label_visibility="visible"):
+        return value if value is not None else min_value
+
 # Replace the real streamlit with our mock
 sys.modules["streamlit"] = MockStreamlit()
 

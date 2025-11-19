@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go  # type: ignore[import-untyped]
 from matplotlib.path import Path as MplPath
+import shapely
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely import wkt
 
@@ -475,38 +476,17 @@ def _get_preclipped_voronoi_edges(
         return [], pts
 
     clip_polygon = wkt.loads(clip_poly_wkt) if clip_poly_wkt else None
-    raw_edges = []
-
-    # Helper to clip segment
-    def _clip(p1: tuple[float, float], p2: tuple[float, float]) -> list[tuple[float, float, float, float]]:
-        if clip_polygon is None:
-            return [(p1[0], p1[1], p2[0], p2[1])]
-        
-        seg = LineString([p1, p2])
-        inter = seg.intersection(clip_polygon)
-        if inter.is_empty:
-            return []
-        
-        res = []
-        if inter.geom_type == 'LineString':
-            coords = list(inter.coords)
-            if len(coords) >= 2:
-                res.append((coords[0][0], coords[0][1], coords[-1][0], coords[-1][1]))
-        elif inter.geom_type == 'MultiLineString':
-            for ls in inter.geoms:
-                coords = list(ls.coords)
-                if len(coords) >= 2:
-                    res.append((coords[0][0], coords[0][1], coords[-1][0], coords[-1][1]))
-        return res
+    
+    # Collect all candidate segments first
+    # Each candidate: (x1, y1, x2, y2, p1_idx, p2_idx)
+    candidates = []
 
     # Finite edges
     for (p1_idx, p2_idx), rv in zip(vor.ridge_points, vor.ridge_vertices):
         if -1 not in rv:
             v1 = vor.vertices[rv[0]]
             v2 = vor.vertices[rv[1]]
-            segments = _clip((v1[0], v1[1]), (v2[0], v2[1]))
-            for s in segments:
-                raw_edges.append((*s, int(p1_idx), int(p2_idx)))
+            candidates.append((v1[0], v1[1], v2[0], v2[1], int(p1_idx), int(p2_idx)))
         else:
             # Infinite edges
             vs = [v for v in rv if v != -1]
@@ -532,9 +512,67 @@ def _get_preclipped_voronoi_edges(
                 minx, miny, maxx, maxy = clip_polygon.bounds
                 L = max(maxx - minx, maxy - miny) * 5.0 + 1e-6
                 far = v0 + dir_vec * L
-                segments = _clip((v0[0], v0[1]), (far[0], far[1]))
-                for s in segments:
-                    raw_edges.append((*s, int(p1_idx), int(p2_idx)))
+                candidates.append((v0[0], v0[1], far[0], far[1], int(p1_idx), int(p2_idx)))
+
+    if not candidates:
+        return [], pts
+
+    if clip_polygon is None:
+        return candidates, pts
+
+    # Vectorized clipping using shapely 2.0+
+    # Construct LineStrings
+    c_arr = np.array(candidates)
+    # coords shape: (N, 2, 2) -> (N, 2 points, 2 coords)
+    # c_arr columns: x1, y1, x2, y2, ...
+    coords = c_arr[:, :4].reshape(-1, 2, 2)
+    
+    lines = shapely.linestrings(coords)
+    
+    # 1. Filter non-intersecting (OUTSIDE) - Fast predicate
+    intersects_mask = shapely.intersects(lines, clip_polygon)
+    
+    if not np.any(intersects_mask):
+        return [], pts
+        
+    lines_candidates = lines[intersects_mask]
+    c_arr_candidates = c_arr[intersects_mask]
+    
+    # 2. Identify fully contained (INSIDE) - Fast predicate
+    contains_mask = shapely.contains(clip_polygon, lines_candidates)
+    
+    raw_edges = []
+    
+    # Process INSIDE edges (no clipping needed)
+    inside_c = c_arr_candidates[contains_mask]
+    for row in inside_c:
+        raw_edges.append((row[0], row[1], row[2], row[3], int(row[4]), int(row[5])))
+        
+    # Process CROSSING edges (clipping needed)
+    # Only perform expensive intersection on these
+    crossing_lines = lines_candidates[~contains_mask]
+    crossing_c = c_arr_candidates[~contains_mask]
+    
+    if len(crossing_lines) > 0:
+        intersections = shapely.intersection(crossing_lines, clip_polygon)
+        
+        for geom, orig in zip(intersections, crossing_c):
+            if geom.is_empty:
+                continue
+                
+            p1_idx, p2_idx = int(orig[4]), int(orig[5])
+            
+            if geom.geom_type == 'LineString':
+                coords = geom.coords
+                if len(coords) >= 2:
+                    raw_edges.append((coords[0][0], coords[0][1], coords[-1][0], coords[-1][1], p1_idx, p2_idx))
+            elif geom.geom_type == 'MultiLineString':
+                for ls in geom.geoms:
+                    coords = ls.coords
+                    if len(coords) >= 2:
+                        raw_edges.append((coords[0][0], coords[0][1], coords[-1][0], coords[-1][1], p1_idx, p2_idx))
+                    
+    return raw_edges, pts
 
     return raw_edges, pts
 
@@ -549,37 +587,56 @@ def _filter_voronoi_edges(
 ) -> list[tuple[float, float, float, float]]:
     """
     Cached filtering of Voronoi edges based on weights.
+    Vectorized implementation for performance.
     """
+    if not raw_edges_tuple:
+        return []
+
+    # Convert to numpy for vectorization
+    # Shape (N, 6): x1, y1, x2, y2, i1, i2
+    edges = np.array(raw_edges_tuple)
+    
+    x1, y1 = edges[:, 0], edges[:, 1]
+    x2, y2 = edges[:, 2], edges[:, 3]
+    i1 = edges[:, 4].astype(int)
+    i2 = edges[:, 5].astype(int)
+    
     pts = np.frombuffer(pts_bytes).reshape(pts_shape)
     inv_w = np.array(inv_w_tuple)
     
-    kept_edges = []
+    # Generator points
+    p1_lon, p1_lat = pts[i1, 0], pts[i1, 1]
+    p2_lon, p2_lat = pts[i2, 0], pts[i2, 1]
     
-    for x1, y1, x2, y2, i1, i2 in raw_edges_tuple:
-        # Sample points to check tolerance
-        # We check if the weighted distance difference is small enough
-        
-        # Optimization: Check endpoints and midpoint first
-        samples = [(x1, y1), (x2, y2), ((x1+x2)/2, (y1+y2)/2)]
-        
-        min_diff = float('inf')
-        
-        for sx, sy in samples:
-            d1 = haversine_m(sy, sx, pts[i1, 1], pts[i1, 0])
-            d2 = haversine_m(sy, sx, pts[i2, 1], pts[i2, 0])
-            
-            # Weighted distance: d - w * R
-            wd1 = d1 - inv_w[i1] * max(radius_m, 1e-6)
-            wd2 = d2 - inv_w[i2] * max(radius_m, 1e-6)
-            
-            diff = abs(wd1 - wd2)
-            if diff < min_diff:
-                min_diff = diff
-        
-        if min_diff < tolerance_m:
-            kept_edges.append((x1, y1, x2, y2))
-            
-    return kept_edges
+    # Weights
+    r_eff = max(radius_m, 1e-6)
+    w1 = inv_w[i1] * r_eff
+    w2 = inv_w[i2] * r_eff
+    
+    # Vectorized haversine checks
+    # Sample 1: Start point
+    d1_s1 = haversine_m(y1, x1, p1_lat, p1_lon)
+    d2_s1 = haversine_m(y1, x1, p2_lat, p2_lon)
+    diff_s1 = np.abs((d1_s1 - w1) - (d2_s1 - w2))
+    
+    # Sample 2: End point
+    d1_s2 = haversine_m(y2, x2, p1_lat, p1_lon)
+    d2_s2 = haversine_m(y2, x2, p2_lat, p2_lon)
+    diff_s2 = np.abs((d1_s2 - w1) - (d2_s2 - w2))
+    
+    # Sample 3: Midpoint
+    xm, ym = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+    d1_s3 = haversine_m(ym, xm, p1_lat, p1_lon)
+    d2_s3 = haversine_m(ym, xm, p2_lat, p2_lon)
+    diff_s3 = np.abs((d1_s3 - w1) - (d2_s3 - w2))
+    
+    # Filter condition
+    min_diff = np.minimum(diff_s1, np.minimum(diff_s2, diff_s3))
+    mask = min_diff < tolerance_m
+    
+    # Return filtered edges
+    filtered = edges[mask, :4]
+    return [tuple(x) for x in filtered.tolist()]
 
 def inverted_weighted_voronoi_edges(
     df: pd.DataFrame,

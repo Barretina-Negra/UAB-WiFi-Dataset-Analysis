@@ -93,6 +93,18 @@ from dashboard.data_io import (
 )
 _log_profile("Data IO Imports Complete")
 
+# --- Caching Wrappers ---
+@st.cache_data(show_spinner=False)
+def get_cached_snapshots(ap_dir: Path) -> List[Tuple[Path, datetime]]:
+    """Cached wrapper for finding snapshot files."""
+    return find_snapshot_files(ap_dir)
+
+@st.cache_data(show_spinner=False)
+def get_cached_geoloc(geojson_path: Path) -> pd.DataFrame:
+    """Cached wrapper for reading geolocation points."""
+    return read_geoloc_points(geojson_path)
+# ------------------------
+
 if TYPE_CHECKING:
     pass
 else:
@@ -1267,7 +1279,7 @@ elif viz_mode == "Voronoi":
                             lons.append(x)
                             lats.append(y)
                         lons.append(None)
-                        lats.appen(None)
+                        lats.append(None)
                 if merged_lines.geom_type == 'LineString':
                     add_lines(merged_lines)
                 elif merged_lines.geom_type == 'MultiLineString':
