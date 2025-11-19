@@ -391,6 +391,10 @@ def simulate_ap_addition(
     Returns:
         Tuple of (updated_df, new_ap_stats, scenario_metrics)
     """
+    # Ensure baseline conflictivity is consistent with our current scoring logic
+    # This prevents artifacts where the simulator's scoring differs from the dataset's pre-calculated values
+    df_baseline = recalculate_conflictivity(df_baseline.copy())
+
     df_updated, new_ap_stats = estimate_client_distribution(
         df_baseline, new_ap_lat, new_ap_lon, config, mode='hybrid'
     )
