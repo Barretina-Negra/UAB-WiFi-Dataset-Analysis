@@ -28,6 +28,7 @@ print(f"[PROFILE] Script Start: {_profile_start}", file=sys.stderr)
 import math
 import re
 import sys
+from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -605,13 +606,13 @@ if not GEOJSON_PATH.exists():
     st.error(f"GeoJSON not found: {GEOJSON_PATH}")
     st.stop()
 
-snapshots = find_snapshot_files(AP_DIR)
+snapshots = get_cached_snapshots(AP_DIR)
 _log_profile("Snapshots Found")
 if not snapshots:
     st.warning("No AP snapshots found in realData/ap. Please add AP-info-v2-*.json files.")
     st.stop()
 
-geo_df = read_geoloc_points(GEOJSON_PATH)
+geo_df = get_cached_geoloc(GEOJSON_PATH)
 _log_profile("GeoJSON Loaded")
 
 # Sidebar
@@ -2029,58 +2030,3 @@ else:  # Simulator
                 )
         
         st.caption(f"💡 **{len(vor_df)} candidates detected**. Freq = how many scenarios this vertex appeared in. Higher frequency = more stable location.")
-
-# Top conflictive APs table (common to all three modes)
-st.subheader("Top conflictive Access Points")
-filtered_for_table = map_df[map_df["conflictivity"] >= min_conf].copy()
-if filtered_for_table.empty:
-    st.info(f"No APs with conflictivity >= {min_conf:.2f}")
-else:
-    cols = ["name", "group_code", "client_count", "max_radio_util", "conflictivity"]
-    cols = [c for c in cols if c in filtered_for_table.columns]
-    top_df = (
-        filtered_for_table[cols]
-        .sort_values("conflictivity", ascending=False)
-        .head(top_n)
-        .rename(
-            columns={
-                "name": "Access Point",
-                "group_code": "Building",
-                "conflictivity": "Conflictivity Score",
-                "client_count": "Clients",
-                "max_radio_util": "Radio Util % (agg)",
-            }
-        )
-    )
-    top_df["Conflictivity Score"] = top_df["Conflictivity Score"].map(lambda x: f"{x:.3f}")
-    st.dataframe(top_df, width="stretch", hide_index=True)
-
-band_info = {
-    "worst": "Worst band (max of 2.4/5 GHz)",
-    "avg": "Weighted average of band maxima (2.4:60%, 5 GHz 0:40%)",
-    "2.4GHz": "2.4 GHz only",
-    "5GHz": "5 GHz only",
-}
-
-_log_profile("Script Execution Complete")
-
-if viz_mode == "AI Heatmap":
-    st.caption(
-        f"📻 Band mode: {band_info[band_mode]}  |  "
-        "💡 Conflictivity measures Wi-Fi stress by combining channel congestion (75%), number of connected devices (15%), and AP resource usage (10%)  |  "
-        "🟢 Low ↔ 🔴 High (0–1)  |  "
-        "👆 Selecciona un AP al mapa per analitzar-lo amb AINA AI"
-    )
-elif viz_mode == "Voronoi":
-    st.caption(
-        f"📻 Band mode: {band_info[band_mode]}  |  "
-        "💡 Conflictivity ≈ 0.75×airtime + 0.15×clients + 0.05×CPU + 0.05×Memòria  |  "
-        "🎨 Escala: 🟢 Low → 🟡 Medium → 🔴 High (0–1)"
-    )
-else:  # Simulator
-    st.caption(
-        f"📻 Band mode: {band_info[band_mode]}  |  "
-        "💡 Conflictivity ≈ 0.85×airtime + 0.10×clients + 0.02×CPU + 0.03×Memòria  |  "
-        "🎨 Escala: 🟢 Low → 🟡 Medium → 🔴 High (0–1)  |  "
-        "🎯 Multi-scenario AP placement optimization"
-    )
