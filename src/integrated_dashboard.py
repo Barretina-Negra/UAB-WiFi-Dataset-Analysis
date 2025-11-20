@@ -1149,7 +1149,7 @@ Si n'hi ha un numero alt d'ambos, doncs clarament el raonament es ambdos. Pero 2
 if viz_mode == "AI Heatmap":
     # ========== AI HEATMAP MODE ==========
     st.info(
-        "ℹ️ **Guide:** The **colored circles** on the map represent Access Points (APs). "
+        "ℹ️ **Guide:** The **colored circles** on the map represent Access Points (APs).\n\n"
         "Click on any **conflicting AP** (orange/red) to ask **AIna** for a diagnosis: "
         "she will analyze if the issue is due to **device saturation** (CPU/RAM) or **airtime congestion**."
     )
@@ -1200,6 +1200,12 @@ if viz_mode == "AI Heatmap":
 
 elif viz_mode == "Voronoi":
     # ========== VORONOI MODE ==========
+    st.info(
+        "ℹ️ **Guide:** This map shows the **interpolated conflictivity** across the campus.\n\n"
+        "The **blue lines** (Voronoi edges) indicate boundaries between AP coverage areas. "
+        "Use this to identify **'dark zones'** or gaps where signal quality might degrade between access points."
+    )
+
     tmp = map_df.copy()
     if "group_code" not in tmp.columns:
         tmp["group_code"] = tmp["name"].apply(extract_group)
@@ -1407,6 +1413,11 @@ elif viz_mode == "Voronoi":
 
 else:  # Simulator
     # ========== SIMULATOR MODE ==========
+    st.info(
+        "ℹ️ **Guide:** This tool **automatically simulates** the addition of a new AP to **optimize network coverage**.\n\n"
+        "The simulation runs with default parameters. You can adjust the **Candidate Generation Mode** (Tile-based or Voronoi) and other settings in the sidebar to refine the search for the best location."
+    )
+
     tmp = map_df.copy()
     if "group_code" not in tmp.columns:
         tmp["group_code"] = tmp["name"].apply(extract_group)
