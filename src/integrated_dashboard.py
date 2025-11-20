@@ -1148,6 +1148,12 @@ Si n'hi ha un numero alt d'ambos, doncs clarament el raonament es ambdos. Pero 2
 
 if viz_mode == "AI Heatmap":
     # ========== AI HEATMAP MODE ==========
+    st.info(
+        "ℹ️ **Guide:** The **colored circles** on the map represent Access Points (APs). "
+        "Click on any **conflicting AP** (orange/red) to ask **AIna** for a diagnosis: "
+        "she will analyze if the issue is due to **device saturation** (CPU/RAM) or **airtime congestion**."
+    )
+
     config = HeatmapConfig(
         min_conflictivity=min_conf,
         marker_radius=5,
