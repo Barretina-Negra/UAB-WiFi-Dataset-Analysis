@@ -658,7 +658,7 @@ def generate_voronoi_candidates(
         return pd.DataFrame()
 
     # Import read_ap_snapshot from parent context - needs to be passed or imported
-    from dashboard.data_io import read_ap_snapshot
+    from dashboard.data_io import read_ap_snapshot, extract_group
     
     records: list[Dict[str, Any]] = []
     effective_max_dist = max(0.0, radius_m - tile_radius_clearance_m)
@@ -667,7 +667,16 @@ def generate_voronoi_candidates(
         try:
             df_snap = read_ap_snapshot(snap_path, band_mode='worst')
             df_snap = df_snap.merge(geo_df, on='name', how='inner')
+            
+            if "group_code" not in df_snap.columns:
+                df_snap["group_code"] = df_snap["name"].apply(extract_group)
+            
             df_snap = df_snap[df_snap['group_code'] != 'SAB'].copy()
+
+            # Ensure conflictivity is calculated
+            if 'conflictivity' not in df_snap.columns:
+                df_snap = recalculate_conflictivity(df_snap)
+
             if df_snap.empty:
                 continue
             pts_xy = df_snap[['lon', 'lat']].to_numpy()  # type: ignore[call-overload]
