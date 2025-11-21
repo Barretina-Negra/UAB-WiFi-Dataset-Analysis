@@ -1680,6 +1680,7 @@ else:  # Simulator
                                         'Final Score: %{customdata[0]:.3f} ± %{customdata[1]:.3f}<br>'
                                         'Avg Reduction: %{customdata[2]:.3f}<br>'
                                         'Worst AP Improvement: %{customdata[3]:.3f}<br>'
+                                        'Impact Efficiency: %{customdata[6]:.3f}<br>'
                                         'New AP Clients: %{customdata[4]:.0f}<br>'
                                         'Scenarios Tested: %{customdata[5]:.0f}<br>'
                                         '<extra></extra>'
@@ -1691,6 +1692,7 @@ else:  # Simulator
                                         [best['worst_ap_improvement_raw_mean']],
                                         [best['new_ap_client_count_mean']],
                                         [best['n_scenarios']],
+                                        [best.get('impact_efficiency_mean', 0.0)],
                                     ]),
                                 ))
                             
@@ -1751,8 +1753,16 @@ else:  # Simulator
                                 width="stretch"
                             )
                             
-                            col1, col2, col3, col4 = st.columns(4)
                             best = results_df.iloc[0]
+                            
+                            # Main Score - Prominently displayed
+                            st.metric(
+                                "Impact Efficiency", 
+                                f"{best.get('impact_efficiency_mean', 0.0):.3f}", 
+                                help="Average improvement on APs that actually improved significantly (>0.05). This is the primary measure of placement quality."
+                            )
+                            
+                            col1, col2, col3, col4 = st.columns(4)
                             
                             with col1:
                                 st.metric("Best Score", f"{best['final_score']:.3f}", 
@@ -1877,6 +1887,7 @@ else:  # Simulator
                 text=[p.get('label', 'AP-NEW') for p in nn],
                 textposition='top center',
                 name='New APs (simulated)',
+                hovertemplate="<b>%{text}</b><extra>(%{lat:.5f}, %{lon:.5f})</extra>"
             ))
         
         fig_sim.update_layout(

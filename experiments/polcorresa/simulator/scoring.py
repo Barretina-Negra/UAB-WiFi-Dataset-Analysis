@@ -30,10 +30,10 @@ class CompositeScorer:
     
     def __init__(
         self,
-        weight_worst_ap: float = 0.30,
-        weight_average: float = 0.30,
-        weight_coverage: float = 0.20,
-        weight_neighborhood: float = 0.20,
+        weight_worst_ap: float = 0.50,  # Optimized from benchmark
+        weight_average: float = 0.20,
+        weight_coverage: float = 0.15,
+        weight_neighborhood: float = 0.15,
         neighborhood_mode: NeighborhoodOptimizationMode = NeighborhoodOptimizationMode.BALANCED,
         interference_radius_m: float = 50.0,
     ):
@@ -93,12 +93,21 @@ class CompositeScorer:
         avg_score = max(0.0, avg_score)
         
         # 3. Coverage (fraction of APs that improve by at least 0.05)
-        num_improved = int((delta > 0.05).sum())
+        significant_improvement_mask = delta > 0.05
+        num_improved = int(significant_improvement_mask.sum())
         total_aps = len(baseline_conflictivity)
         coverage_score = num_improved / total_aps if total_aps > 0 else 0.0
         
         # 4. Neighborhood health
-        neighborhood_score = self._compute_neighborhood_score(delta, neighbor_mask)
+        neighborhood_score, neighborhood_raw = self._compute_neighborhood_score(delta, neighbor_mask)
+
+        # 5. Impact Efficiency (New Metric)
+        # Measures the average improvement ONLY on APs that had significant improvement.
+        # This decouples the score from the network size.
+        if num_improved > 0:
+            impact_efficiency = float(delta[significant_improvement_mask].mean())
+        else:
+            impact_efficiency = 0.0
         
         return {
             'worst_ap': worst_score,
@@ -110,13 +119,15 @@ class CompositeScorer:
             'worst_ap_improvement_raw': worst_ap_improvement,
             'avg_reduction_raw': avg_reduction,
             'num_improved': num_improved,
+            'neighborhood_improvement_raw': neighborhood_raw,
+            'impact_efficiency': impact_efficiency,
         }
     
     def _compute_neighborhood_score(
         self,
         delta: np.ndarray,
         neighbor_mask: np.ndarray,
-    ) -> float:
+    ) -> tuple[float, float]:
         """
         Compute neighborhood health score based on selected mode.
         
@@ -125,38 +136,42 @@ class CompositeScorer:
             neighbor_mask: Boolean array for neighbors
         
         Returns:
-            Neighborhood score in [0, 1]
+            Tuple of (Neighborhood score in [0, 1], Raw average improvement)
         """
         if not np.any(neighbor_mask):
-            return 0.5  # Neutral if no neighbors
+            return 0.5, 0.0  # Neutral if no neighbors
         
         neighbor_deltas = delta[neighbor_mask]
+        raw_avg = float(neighbor_deltas.mean())
         
         if self.neigh_mode == NeighborhoodOptimizationMode.IMPROVED_FRACTION:
             # Fraction of neighbors that improve (delta > 0)
             improved = (neighbor_deltas > 0).sum()
             total = len(neighbor_deltas)
-            return float(improved / total) if total > 0 else 0.0
+            score = float(improved / total) if total > 0 else 0.0
+            return score, raw_avg
         
         elif self.neigh_mode == NeighborhoodOptimizationMode.AVG_IMPROVEMENT:
             # Average improvement (clamped to [0, 1])
-            avg_improvement = float(neighbor_deltas.mean())
             # Map to [0, 1]: assume 0.15 improvement = perfect score
-            return np.clip(avg_improvement / 0.15, 0.0, 1.0)
+            score = np.clip(raw_avg / 0.15, 0.0, 1.0)
+            return score, raw_avg
         
         elif self.neigh_mode == NeighborhoodOptimizationMode.MIN_IMPROVEMENT:
             # Worst neighbor improvement (ensure no one degrades badly)
             min_improvement = float(neighbor_deltas.min())
             # Map: -0.1 (10% worse) = 0, 0.0 (no change) = 0.5, +0.1 (10% better) = 1.0
-            return np.clip((min_improvement + 0.1) / 0.2, 0.0, 1.0)
+            score = np.clip((min_improvement + 0.1) / 0.2, 0.0, 1.0)
+            return score, raw_avg
         
         else:  # BALANCED
             # Combine: 40% improved fraction + 40% avg + 20% min
             frac_score = (neighbor_deltas > 0).sum() / len(neighbor_deltas)
-            avg_score = np.clip(neighbor_deltas.mean() / 0.15, 0.0, 1.0)
+            avg_score = np.clip(raw_avg / 0.15, 0.0, 1.0)
             min_score = np.clip((neighbor_deltas.min() + 0.1) / 0.2, 0.0, 1.0)
             
-            return 0.4 * frac_score + 0.4 * avg_score + 0.2 * min_score
+            score = 0.4 * frac_score + 0.4 * avg_score + 0.2 * min_score
+            return score, raw_avg
     
     def compute_composite_score(
         self,

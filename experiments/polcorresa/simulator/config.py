@@ -131,7 +131,7 @@ class SimulationConfig:
     min_rssi_dbm: float = -75.0
     
     # Interference
-    interference_radius_m: float = 25.0
+    interference_radius_m: float = 20.0
     cca_increase_factor: float = 0.02
     channel_overlap_prob_2g: float = 0.33
     channel_overlap_prob_5g: float = 0.10
@@ -156,10 +156,10 @@ class SimulationConfig:
     target_stress_profile: Optional[StressLevel] = StressLevel.HIGH
     
     # Scoring weights (must sum to 1.0)
-    weight_worst_ap: float = 0.30
-    weight_average: float = 0.30
-    weight_coverage: float = 0.20
-    weight_neighborhood: float = 0.20
+    weight_worst_ap: float = 0.50
+    weight_average: float = 0.20
+    weight_coverage: float = 0.15
+    weight_neighborhood: float = 0.15
     
     # Stress classification
     utilization_threshold_critical: float = 70.0

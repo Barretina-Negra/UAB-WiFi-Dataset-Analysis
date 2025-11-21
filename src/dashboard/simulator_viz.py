@@ -809,6 +809,7 @@ def aggregate_scenario_results(
         'avg_reduction_raw',
         'num_improved',
         'new_ap_client_count',
+        'impact_efficiency',
     )
     for key in metric_keys:
         values = [float(r.get(key, 0.0)) for r in scenario_results]
