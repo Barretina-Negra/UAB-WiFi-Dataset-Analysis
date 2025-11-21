@@ -1755,6 +1755,18 @@ else:  # Simulator
                             
                             best = results_df.iloc[0]
                             
+                            # Sync Voronoi selection with Best Result if applicable
+                            # This ensures the "Best Location" is pre-selected in the table below
+                            if 'voronoi_candidates' in st.session_state and not st.session_state.voronoi_candidates.empty:
+                                vor_df_sync = st.session_state.voronoi_candidates
+                                # Find integer index of the match
+                                match_idx = np.where(
+                                    (np.abs(vor_df_sync['lat'].values - best['lat']) < 1e-5) & 
+                                    (np.abs(vor_df_sync['lon'].values - best['lon']) < 1e-5)
+                                )[0]
+                                if len(match_idx) > 0:
+                                    st.session_state['vor_selected_rows'] = {int(match_idx[0])}
+
                             # Main Score - Prominently displayed
                             impact_eff = best.get('impact_efficiency_mean', 0.0)
                             st.metric(
@@ -1766,15 +1778,30 @@ else:  # Simulator
                             col1, col2, col3, col4 = st.columns(4)
                             
                             with col1:
-                                st.metric("Best Score", f"{best['final_score']:.3f}", 
- 
-                                         delta=f"±{best['score_std']:.3f}")
+                                st.metric(
+                                    "Best Score", 
+                                    f"{best['final_score']:.3f}", 
+                                    delta=f"±{best['score_std']:.3f}",
+                                    help="Composite score (0-1) combining worst-AP improvement, average reduction, coverage, and neighborhood health."
+                                )
                             with col2:
-                                st.metric("Avg Reduction", f"{best['avg_reduction_raw_mean']:.3f}")
+                                st.metric(
+                                    "Avg Reduction", 
+                                    f"{best['avg_reduction_raw_mean']:.3f}",
+                                    help="Average reduction in conflictivity across the entire network."
+                                )
                             with col3:
-                                st.metric("Worst AP Improvement", f"{best['worst_ap_improvement_raw_mean']:.3f}")
+                                st.metric(
+                                    "Worst AP Improvement", 
+                                    f"{best['worst_ap_improvement_raw_mean']:.3f}",
+                                    help="Reduction in conflictivity for the most stressed AP in the network."
+                                )
                             with col4:
-                                st.metric("New AP Clients", f"{int(best['new_ap_client_count_mean'])}")
+                                st.metric(
+                                    "Clients on New AP", 
+                                    f"{int(best['new_ap_client_count_mean'])}",
+                                    help="Projected number of clients that will connect to this new AP."
+                                )
                             
                             if best.get('warnings'):
                                 st.subheader("⚠️ Placement Warnings")
