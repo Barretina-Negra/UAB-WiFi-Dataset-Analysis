@@ -1756,9 +1756,10 @@ else:  # Simulator
                             best = results_df.iloc[0]
                             
                             # Main Score - Prominently displayed
+                            impact_eff = best.get('impact_efficiency_mean', 0.0)
                             st.metric(
                                 "Impact Efficiency", 
-                                f"{best.get('impact_efficiency_mean', 0.0):.3f}", 
+                                f"{impact_eff * 100:.1f}%", 
                                 help="Average improvement on APs that actually improved significantly (>0.05). This is the primary measure of placement quality."
                             )
                             
